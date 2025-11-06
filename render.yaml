@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: orbidigi-scraper-name
+    env: docker
+    plan: free
+    region: frankfurt
+    autoDeploy: true
+    envVars:
+      - key: ERANK_EMAIL
+        value:orbidigi@proton.me
+      - key: ERANK_PASS
+        value: Orbidigi1314.

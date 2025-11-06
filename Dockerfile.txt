@@ -1,0 +1,17 @@
+FROM node:18
+
+# Crear directorio de trabajo
+WORKDIR /app
+
+# Copiar dependencias y código
+COPY package.json .
+COPY index.js .
+
+# Instalar dependencias
+RUN npm install
+
+# Exponer el puerto que usará Render
+EXPOSE 3000
+
+# Comando de arranque
+CMD ["node", "index.js"]
