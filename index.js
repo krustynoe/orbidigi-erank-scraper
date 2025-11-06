@@ -1,45 +1,40 @@
-const express2 = require('express');
-const puppeteer2 = require('puppeteer');
+const express = require('express');
+const chromium = require('chrome-aws-lambda');
+const puppeteer = require('puppeteer-core');
 
+const app = express();
+const port = process.env.PORT || 3000;
 
-const app2 = express2();
-const port2 = process.env.PORT || 3000;
+app.get('/', async (req, res) => {
+  const keyword = req.query.q || 'digital planner';
 
+  const browser = await puppeteer.launch({
+    args: chromium.args,
+    defaultViewport: chromium.defaultViewport,
+    executablePath: await chromium.executablePath,
+    headless: chromium.headless,
+    ignoreHTTPSErrors: true
+  });
 
-app2.get('/', async (req, res) => {
-const keyword = req.query.q || 'digital planner';
+  const page = await browser.newPage();
+  await page.goto('https://erank.com/login');
 
-const browser = await puppeteer.launch({
-  headless: true,
-  executablePath: '/usr/bin/google-chrome',
-  args: ['--no-sandbox', '--disable-setuid-sandbox']
+  await page.type('#email', process.env.ERANK_EMAIL);
+  await page.type('#password', process.env.ERANK_PASS);
+  await page.click('button[type="submit"]');
+  await page.waitForNavigation();
+
+  await page.goto('https://erank.com/dashboard');
+  await page.waitForTimeout(5000);
+
+  const result = await page.evaluate(() =>
+    [...document.querySelectorAll('h3')].map(el => el.innerText)
+  );
+
+  await browser.close();
+  res.json({ keyword, result });
 });
 
-
-const page = await browser.newPage();
-await page.goto('https://erank.com/login');
-
-
-await page.type('#email', process.env.ERANK_EMAIL);
-await page.type('#password', process.env.ERANK_PASS);
-await page.click('button[type="submit"]');
-await page.waitForNavigation();
-
-
-await page.goto('https://erank.com/dashboard');
-await page.waitForTimeout(5000);
-
-
-const result = await page.evaluate(() => {
-return [...document.querySelectorAll('h3')].map(el => el.innerText);
-});
-
-
-await browser.close();
-res.json({ keyword, result });
-});
-
-
-app2.listen(port2, () => {
-console.log(`ERANK scraper live on port ${port2}`);
+app.listen(port, () => {
+  console.log(`ERANK scraper live on port ${port}`);
 });
