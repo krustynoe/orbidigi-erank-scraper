@@ -9,11 +9,10 @@ const port2 = process.env.PORT || 3000;
 app2.get('/', async (req, res) => {
 const keyword = req.query.q || 'digital planner';
 
-
-const browser = await puppeteer2.launch({
-headless: true,
-executablePath: '/usr/bin/google-chrome',
-args: ['--no-sandbox', '--disable-setuid-sandbox']
+const browser = await puppeteer.launch({
+  headless: true,
+  executablePath: '/usr/bin/google-chrome',
+  args: ['--no-sandbox', '--disable-setuid-sandbox']
 });
 
 
