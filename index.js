@@ -1,5 +1,5 @@
 const express = require('express');
-cconst puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -15,7 +15,7 @@ app.get('/', async (req, res) => {
   const page = await browser.newPage();
   await page.goto('https://erank.com/login');
   await page.type('#email', process.env.ERANK_EMAIL);
-  await page.type('#password', process.env.ERANK_PASS);
+  await page.type('#password', process.env.ERANK_PASSWORD);
   await page.click('button[type="submit"]');
   await page.waitForNavigation();
 
