@@ -1,7 +1,6 @@
 const express = require('express');
 cconst puppeteer = require('puppeteer');
 
-
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -33,4 +32,4 @@ app.get('/', async (req, res) => {
 
 app.listen(port, () => {
 console.log('ERANK scraper live on port ' + port);
-);
+});
