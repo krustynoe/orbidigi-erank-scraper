@@ -32,5 +32,5 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(port, () => {
-  //cons`le.log(`ERANK scraper l
-    coconsole.log('ERANK scraper live on port ' + port);
+console.log('ERANK scraper live on port ' + port);
+);
