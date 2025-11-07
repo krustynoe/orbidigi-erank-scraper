@@ -32,5 +32,5 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(port, () => {
-  oconsole.log(`ERANK scraper live on port ${port}`);
-});
+  //cons`le.log(`ERANK scraper l
+    console.log('ERANK scraper live on port ' + port);
