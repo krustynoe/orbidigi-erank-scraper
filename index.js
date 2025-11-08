@@ -1,34 +1,34 @@
 const express = require('express');
 const axios = require('axios');
-const cheerio = require('cheerio');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
 app.get('/', async (req, res) => {
   const query = req.query.q || '';
-  const apiKey = process.env.ZENROWS_API_KEY;
-  const cookiesString = process.env.ERANK_COOKIES || process.env.ERANK_COOKIE || '';
+  const apikey = process.env.ZENROWS_API_KEY;
+  const cookieString = process.env.ERANK_COOKIES || process.env.ERANK_COOKIE || '';
 
-  if (!apiKey) {
+  if (!apikey) {
     return res.status(500).json({ error: 'Missing ZENROWS_API_KEY' });
   }
 
   try {
-    // Build ZenRows parameters
+    // Configure ZenRows parameXYZters with css_extractor to grab h2 and h3 text
     const params = {
-      apikey: apiKey,
+      apikey: apikey,
       url: 'https://members.erank.com/trend-buzz',
       js_render: 'true',
-      custom_headers: 'true'
+      custom_headers: 'true',
+      css_extractor: JSON.stringify({ results: 'h2, h3' }),
     };
 
     // Build Cookie header from Netscape cookie file string
     const headers = {};
-    if (cookiesString.trim()) {
+    if (cookieString.trim()) {
       try {
         const cookiePairs = [];
-        const lines = cookiesString.split(/\r?\n/);
+        const lines = cookieString.split(/\r?\n/);
         for (const line of lines) {
           if (!line || line.startsWith('#')) continue;
           const parts = line.split('\t');
@@ -48,24 +48,31 @@ app.get('/', async (req, res) => {
 
     const response = await axios.get('https://api.zenrows.com/v1/', {
       params,
-      headers
+      headers,
     });
 
-    // Parse HTML to extract text from <h2> and <h3> tags
-    const html = response.data.html || '';
-    const $ = cheerio.load(html);
-    const results = [];
-    $('h2, h3').each((i, elem) => {
-      results.push($(elem).text().trim());
-    });
+    let results = [];
+    if (response.data) {
+      if (Array.isArray(response.data.results)) {
+        results = response.data.results;
+      } else if (typeof response.data.results === 'string') {
+        results = [response.data.results];
+      }
+    }
 
-    return res.json({ query, results });
+    // If query parameter provided, filter results by substring (case-insensitive)
+    if (query) {
+      const qLower = query.toLowerCase();
+      results = results.filter((item) => item.toLowerCase().includes(qLower));
+    }
+
+    res.json({ results });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: err.message || 'Error fetching data' });
+    res.status(500).json({ error: err.message || 'Scraping error' });
   }
 });
 
 app.listen(port, () => {
-  console.log(`Erank scraper live on port ${port}`);
+  console.log(`Server running on port ${port}`);
 });
