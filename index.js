@@ -6,10 +6,16 @@ const cheerio = require('cheerio');
 const app  = express();
 const port = process.env.PORT || 3000;
 
-// Normaliza dobles barras en la URL: //erank -> /erank
-app.use((req, _res, next) => { if (req.url.includes('//')) req.url = req.url.replace(/\/{2,}/g, '/'); next(); });
+// Workaround undici (Node 18): evita "File is not defined"
+globalThis.File = globalThis.File || class File {};
 
-// Healthcheck y listado de rutas
+// Normaliza dobles barras en la URL: //erank -> /erank
+app.use((req, _res, next) => {
+  if (req.url.includes('//')) req.url = req.url.replace(/\/{2,}/g, '/');
+  next();
+});
+
+// Healthcheck
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
 const ZR = process.env.ZENROWS_API_KEY || '';
@@ -19,21 +25,25 @@ function headersWithCookie(cookie) {
   return { 'User-Agent': 'Mozilla/5.0', ...(cookie ? { Cookie: cookie } : {}) };
 }
 
-// Trae HTML renderizado con ZenRows; evita css_extractor para eRank (zona con login)
+// Trae HTML renderizado con ZenRows y lo devuelve como string
 async function fetchHtml(url, cookie = '', waitFor = 'body') {
   const params = {
     apikey: ZR,
     url,
     js_render: 'true',
     custom_headers: 'true',
-    // sube timeout y usa un selector seguro para no colgarte esperando algo que no aparece por login
     wait_for: waitFor,
-    // si lo necesitas para WAF: premium_proxy:'true'
+    // premium_proxy: 'true',           // descomenta si el sitio protege fuerte
+    // block_resources: 'true',
   };
-  const { data } = await axios.get('https://api.cloudflare.com/client/v4/accounts/xxx', { // <-- REPLACE with https://api.zenrows.com/v1/
-    // ^^^^ OJO: aquí pon exactamente 'https://api.zenrows.com/v1/' (dejé un marcador para que lo veas)
+  const { data } = await axios.get('https://api.zenrows.com/v1/', {
+    params,
+    headers: headersWithCookie(cookie),
+    timeout: 90000
   });
-  return typeof data === 'string' ? data : (data?.html || '');
+  if (typeof data === 'string') return data;
+  if (data?.html) return data.html;
+  throw new Error(JSON.stringify(data));
 }
 
 /* ---------------- RUTAS ERANK ---------------- */
@@ -57,11 +67,15 @@ app.get('/erank/keywords', async (req, res) => {
   }
 });
 
-// 2) Productos (ejemplo con destino público, sin cookie) -> { query, count, items[] }
+// 2) Productos (ejemplo público en Etsy) -> { query, count, items[] }
 app.get('/erank/products', async (req, res) => {
   try {
     const q = String(req.query.q || '');
-    const html = await fetchHtml(`https://www.etsy.com/search?q=${encodeURIComponent(q)}`, '', 'li[data-search-result]');
+    const html = await fetchHtml(
+      `https://www.etsy.com/search?q=${encodeURIComponent(q)}`,
+      '',
+      'li[data-search-result]'
+    );
     const $ = cheerio.load(html);
     const items = [];
     $('li[data-search-result]').each((_, el) => {
@@ -79,17 +93,22 @@ app.get('/erank/products', async (req, res) => {
   }
 });
 
-// 3) Listados de una tienda (Etsy público) -> { shop, count, items[] }
+// 3) Listados de una tienda (Etsy) -> { shop, count, items[] }
 app.get('/erank/mylistings', async (req, res) => {
   try {
     const shop = String(req.query.shop || '');
     if (!shop) return res.status(400).json({ error: "Missing 'shop' param" });
-    const html = await fetchHtml(`https://www.etsy.com/shop/${encodeURIComponent(shop)}`, '', '.wt-grid__item-xs-6');
+
+    const html = await fetchHtml(
+      `https://www.etsy.com/shop/${encodeURIComponent(shop)}`,
+      '',
+      '.wt-grid__item-xs-6, .v2-listing-card'
+    );
     const $ = cheerio.load(html);
     const items = [];
     $('.wt-grid__item-xs-6, .v2-listing-card').each((_, el) => {
       const $el = $(el);
-      const title = ($el.find('line-clamp, h3').first().text() || '').trim();
+      const title = ($el.find('h3').first().text() || '').trim();
       const url   = ($el.find('a').attr('href') || '').trim();
       const price = ($el.find('.currency-value').first().text() || '').trim();
       const tags  = ($el.find('[data-buy-box-listing-tags]').text() || '').trim();
@@ -102,11 +121,15 @@ app.get('/erank/mylistings', async (req, res) => {
   }
 });
 
-// 4) Research (tira de tarjetas en trend-buzz; requiere cookie) -> { query, count, items[] }
+// 4) Research (tarjetas en trend-buzz) -> { query, count, items[] }
 app.get('/erank/research', async (req, res) => {
   try {
     const q = String(req.query.q || '');
-    const html = await fetchHtml('https://members.erank.com/trend-buzz', ER, '.trend-card, .card, [data-testid="trend-card"]');
+    const html = await fetchHtml(
+      'https://members.erank.com/trend-buzz',
+      ER,
+      '.trend-card, .card, [data-testid="trend-card"]'
+    );
     const $ = cheerio.load(html);
     const items = [];
     $('.trend-card, .card, [data-testid="trend-card"]').each((_, el) => {
