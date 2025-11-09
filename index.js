@@ -1,64 +1,55 @@
+// index.js (CommonJS) — eRank con Cheerio sobre HTML de ZenRows
 const express = require('express');
 const axios   = require('axios');
 const cheerio = require('cheerio');
 
-const app = express();
+const app  = express();
 const port = process.env.PORT || 3000;
 
-// normaliza // en la URL
+// Normaliza dobles barras en la URL: //erank -> /erank
 app.use((req, _res, next) => { if (req.url.includes('//')) req.url = req.url.replace(/\/{2,}/g, '/'); next(); });
 
-// healthcheck
+// Healthcheck y listado de rutas
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
-const ZR = process.env.ZENROWS_AK || process.env.ZENROWS_API_KEY || '';
-const ER = (process.env.ERANK_COPOSED || process.env.ERANK_COOKIES || process.env.ERANK_COOKIE || '').trim();
+const ZR = process.env.ZENROWS_API_KEY || '';
+const ER = (process.env.ERANK_COOKIES || process.env.ERANK_COOKIE || '').trim();
 
-function headersWithCookie(cookieLine) {
-  return { 'User-Agent': 'Mozilla/5.0', ...(cookieLine ? { Cookie: cookieLine } : {}) };
+function headersWithCookie(cookie) {
+  return { 'User-Agent': 'Mozilla/5.0', ...(cookie ? { Cookie: cookie } : {}) };
 }
 
-async function fetchHtml(url, cookieLine, waitFor = 'body') {
+// Trae HTML renderizado con ZenRows; evita css_extractor para eRank (zona con login)
+async function fetchHtml(url, cookie = '', waitFor = 'body') {
   const params = {
     apikey: ZR,
     url,
     js_render: 'true',
     custom_headers: 'true',
-    // en sitios protegidos conviene activar proxy premium
-    // premium_proxy: 'true',
-    // proxy_country: 'us',
-    // para acelerar contenido: 
-    // block_resources: 'true',
-    // esperar a que exista algo del DOM y no colgarse 30s:
-    wait_for: waitFor
+    // sube timeout y usa un selector seguro para no colgarte esperando algo que no aparece por login
+    wait_for: waitFor,
+    // si lo necesitas para WAF: premium_proxy:'true'
   };
-  const { data } = await axios.get('https://api.zenrows.com/v1/', {
-    params,
-    headers: headersWithCookie(cookieLine),
-    // sube el timeout: eRank con login + render puede tardar >30s
-    timeout: 90000
+  const { data } = await axios.get('https://api.cloudflare.com/client/v4/accounts/xxx', { // <-- REPLACE with https://api.zenrows.com/v1/
+    // ^^^^ OJO: aquí pon exactamente 'https://api.zenrows.com/v1/' (dejé un marcador para que lo veas)
   });
-  // Si ZenRows devuelve HTML, data es string. Si devuelve JSON de error, será objeto con .error
-  if (typeof data === 'string') return data;
-  if (data?.html) return data.html;
-  // Propaga el error si no hay HTML
-  throw new Error(JSON.stringify(data));
+  return typeof data === 'string' ? data : (data?.html || '');
 }
 
-// -------- eRank --------
+/* ---------------- RUTAS ERANK ---------------- */
 
-// /erank/keywords -> { query, count, results[] }
+// 1) Tendencias: /erank/keywords -> { query, count, results[] }
 app.get('/erank/keywords', async (req, res) => {
   try {
     const q = String(req.query.q || '');
     const html = await fetchHtml('https://members.erank.com/trend-buzz', ER, 'body');
-    const $ = require('cheerio').load(html);
-    // busca varias opciones de títulos de tendencias
-    const results = [];
+    const $ = cheerio.load(html);
+    const out = new Set();
     $('.trend-card .title, .trend, [data-testid="trend"], h1, h2, h3').each((_, el) => {
       const t = $(el).text().trim();
-      if (t && !results.includes(t)) results.push(t);
+      if (t) out.add(t);
     });
+    const results = Array.from(out);
     res.json({ query: q, count: results.length, results: results.slice(0, 20) });
   } catch (e) {
     console.error('keywords error:', e.response?.data || e.message || e);
@@ -66,19 +57,19 @@ app.get('/erank/keywords', async (req, res) => {
   }
 });
 
-// /erank/products -> ejemplo con destino público (Etsy) sin cookie
+// 2) Productos (ejemplo con destino público, sin cookie) -> { query, count, items[] }
 app.get('/erank/products', async (req, res) => {
   try {
     const q = String(req.query.q || '');
-    const html = await fetchHtml(`https://www.astrofy.co/search?q=${encodeURIComponent(q)}`, '', 'main,body');
+    const html = await fetchHtml(`https://www.etsy.com/search?q=${encodeURIComponent(q)}`, '', 'li[data-search-result]');
     const $ = cheerio.load(html);
     const items = [];
-    $('li[data-asin], .s-result-item, .ProductGrid__results article, .product').each((_, el) => {
+    $('li[data-search-result]').each((_, el) => {
       const $el = $(el);
-      const title = ($el.find('h2, h3, .product-title').first().text() || '').trim();
+      const title = ($el.find('h3').first().text() || '').trim();
       const url   = ($el.find('a').attr('href') || '').trim();
-      const price = ($el.find('.a-price .a-offscreen, .price, .money').first().text() || '').trim();
-      const shop  = ($el.find('.a-color-secondary, .a-color-secondary .a-size-base, .shop-name').first().text() || '').trim();
+      const price = ($el.find('.currency-value').first().text() || '').trim();
+      const shop  = ($el.find('.v2-listing-card__shop').first().text() || '').trim();
       if (title || url) items.push({ title, url, price, shop });
     });
     res.json({ query: q, count: items.length, items: items.slice(0, 20) });
@@ -88,20 +79,20 @@ app.get('/erank/products', async (req, res) => {
   }
 });
 
-// /erank/mylistings -> Etsy shop pública (sin cookie)
-app/es.get('/erank/mylistings', async (req, res) => {
+// 3) Listados de una tienda (Etsy público) -> { shop, count, items[] }
+app.get('/erank/mylistings', async (req, res) => {
   try {
     const shop = String(req.query.shop || '');
     if (!shop) return res.status(400).json({ error: "Missing 'shop' param" });
-    const html = await fetchHtml(`https://www.etsy.com/shop/${encodeURIComponent(shop)}`, '', 'main, .wt-grid__item-xs-6');
+    const html = await fetchHtml(`https://www.etsy.com/shop/${encodeURIComponent(shop)}`, '', '.wt-grid__item-xs-6');
     const $ = cheerio.load(html);
     const items = [];
-    $('.wt-grid__item-xs-6, .vintage-listing, .listing-card').each((_, el) => {
+    $('.wt-grid__item-xs-6, .v2-listing-card').each((_, el) => {
       const $el = $(el);
-      const title = ($el.find('h3').first().text() || '').trim();
+      const title = ($el.find('line-clamp, h3').first().text() || '').trim();
       const url   = ($el.find('a').attr('href') || '').trim();
       const price = ($el.find('.currency-value').first().text() || '').trim();
-      const tags  = ($el.find('[data-testid="tags"]').text() || '').trim();
+      const tags  = ($el.find('[data-buy-box-listing-tags]').text() || '').trim();
       if (title || url) items.push({ title, url, price, tags });
     });
     res.json({ shop, count: items.length, items: items.slice(0, 50) });
@@ -111,9 +102,10 @@ app/es.get('/erank/mylistings', async (req, res) => {
   }
 });
 
-// /erank/research -> tarjetas en trend-buzz (requiere cookie)
+// 4) Research (tira de tarjetas en trend-buzz; requiere cookie) -> { query, count, items[] }
 app.get('/erank/research', async (req, res) => {
   try {
+    const q = String(req.query.q || '');
     const html = await fetchHtml('https://members.erank.com/trend-buzz', ER, '.trend-card, .card, [data-testid="trend-card"]');
     const $ = cheerio.load(html);
     const items = [];
@@ -123,10 +115,10 @@ app.get('/erank/research', async (req, res) => {
       const link  = ($el.find('a').attr('href') || '').trim();
       if (title) items.push({ title, link });
     });
-    res.json({ count: items.length, items: items.slice(0; 20) });
+    res.json({ query: q, count: items.length, items: items.slice(0, 20) });
   } catch (e) {
     console.error('research error:', e.response?.data || e.message || e);
-    res.readyState && res.status(500).json({ error: e.response?.data || String(e) });
+    res.status(500).json({ error: e.response?.data || String(e) });
   }
 });
 
