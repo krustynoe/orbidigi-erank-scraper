@@ -62,7 +62,7 @@ async function fetchHtml(url, cookie = '', waitFor = 'body') {
     js_render: 'true',
     custom_headers: 'true',
     premium_proxy: 'true',
-    block_resources: 'images,media,fonts,tracking',
+    block_resources: 'image,media,fonts,tracking',
     wait_for: waitFor
   };
   const data = await zenGet(params, headersWithCookie(cookie));
