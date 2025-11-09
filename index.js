@@ -1,6 +1,5 @@
 // index.js — eRank via ZenRows (rendered DOM) + Cheerio. CommonJS for Node 18 on Render.
 
-// 0) Fix undici File on Node 18 so axios doesn’t throw “File is not defined”
 globalThis.File = globalThis.File || class File {};
 
 const express = require('express');
@@ -10,26 +9,26 @@ const cheerio = require('cheerio');
 const app  = express();
 const port = process.env.PORT || 3000;
 
-// Normalize accidental double slashes in path
+// Normaliza // en paths
 app.use((req, _res, next) => {
   if (req.url.includes('//')) req.url = req.url.replace(/\/{2,}/g, '/');
   next();
 });
 
-// Health endpoints
-app.get('/healthz',      (_req, res) => res.json({ ok: true }));
-app.get('/erank/healthz',(_req, res) => res.json({ ok: true }));
+// Health
+app.get('/healthz',       (_req, res) => res.json({ ok: true }));
+app.get('/erank/healthz', (_req, res) => res.json({ ok: true }));
 
-// --- ENV
-const ZR    = (process.env.ZENROWS_API_KEY || '').trim();
-const ER    = (process.env.ERANK_COOKIES   || '').trim(); // "name=value; name2=value2; ..."
-const PATH  = (process.env.ERANK_TREND_PATH || 'trends').trim(); // 'trends' or 'trend-buzz'
+// ENV
+const ZR   = (process.env.ZENROWS_API_KEY || '').trim();
+const ER   = (process.env.ERANK_COOKIES    || '').trim(); // "name=val; name2=val2"
+const PATH = (process.env.ERANK_TREND_PATH || 'trends').trim(); // 'trends' | 'trend-buzz'
 const TREND_URL = `https://members.erank.com/${PATH}`;
-const UA    = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36';
+const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36';
 
 const http = axios.create({ timeout: 120000 });
 
-// --- ZenRows helper
+// ZenRows helper
 async function fetchRenderedHtml(url, { waitMs = 8000, block = 'image,font,stylesheet' } = {}) {
   const params = {
     apikey: ZR,
@@ -64,43 +63,42 @@ function collectFromDom($) {
   return Array.from(out);
 }
 
-function* jsonBlocksFromScripts($) {
+function jsonBlocksFromScripts($) {
+  const out = [];
+
   // 1) <script type="application/json">...</script>
   $('script[type="application/json"]').each((_, el) => {
     const txt = ($(el).html() || '').trim();
-    if (txt) yield txt;
+    if (txt) out.push(txt);
   });
-  // 2) window.__X = {...}; patterns
+
+  // 2) window.__X = {...}; y arrays
   $('script').each((_, el) => {
     const txt = ($(el).html() || '').trim();
     if (!txt) return;
-    const known = [
-      /__NEXT_DATA__\s*=\s*({[\s\S]*?});/,
-      /__NUXT__\s*=\s*({[\s\S]*?});/,
-      /__INITIAL_STATE__\s*=\s*({[\s\S]*?});/,
-      /window\.[A-Za-z0-9_$.-]+\s*=\s*({[\s\S]*?});/
+
+    const patterns = [
+      /__NEXT_DATA__\s*=\s*({[\s\S]*?});/g,
+      /__NUXT__\s*=\s*({[\s\S]*?});/g,
+      /__INITIAL_STATE__\s*=\s*({[\s\S]*?});/g,
+      /window\.[A-Za-z0-9_$.-]+\s*=\s*({[\s\S]*?});/g,
+      /window\.[A-Za-z0-9_$.-]+\s*=\s*(\[[\s\S]*?\]);/g
     ];
-    for (const re of known) {
+
+    for (const re of patterns) {
       let m;
       while ((m = re.exec(txt))) {
-        const raw = m[1];
-        const trimmed = balanceJson(raw);
-        if (trimmed) yield trimmed;
+        const balanced = balanceJson(m[1]);
+        if (balanced) out.push(balanced);
       }
     }
-    // 3) Arrays
-    const arrRe = /window\.[A-Za-z0-9_$.-]+\s*=\s*(\[[\s\S]*?\]);/g;
-    let m;
-    while ((m = arrRe.exec(txt))) {
-      const raw = m[1];
-      const trimmed = balanceJson(raw);
-      if (trimmed) yield trimmed;
-    }
   });
+
+  return out;
 }
 
 function balanceJson(raw) {
-  const s = raw.trim();
+  const s = (raw || '').trim();
   const first = s[0];
   const open = first === '{' ? '{' : first === '[' ? '[' : null;
   const close = open === '{' ? '}' : open === '[' ? ']' : null;
@@ -109,7 +107,10 @@ function balanceJson(raw) {
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
     if (c === open) depth++;
-    else if (c === close) { depth--; if (depth === 0) return s.slice(0, i + 1); }
+    else if (c === close) {
+      depth--;
+      if (depth === 0) return s.slice(0, i + 1);
+    }
   }
   return null;
 }
@@ -133,7 +134,7 @@ function walkStrings(node, acc) {
   }
 }
 
-// --- Debug
+// Debug
 app.get('/erank/debug', async (req, res) => {
   try {
     const target = String(req.query.url || TREND_URL);
@@ -145,7 +146,7 @@ app.get('/erank/debug', async (req, res) => {
   }
 });
 
-// --- /erank/keywords con retries + JSON fallback
+// /erank/keywords con retries + JSON fallback
 app.get('/erank/keywords', async (req, res) => {
   try {
     const q = String(req.query.q || '').toLowerCase();
@@ -162,14 +163,14 @@ app.get('/erank/keywords', async (req, res) => {
       results = collectFromDom($);
     }
 
-    // 3) 15 s y permitimos stylesheet
+    // 3) 15 s permitiendo stylesheet
     if (results.length === 0) {
       html = await fetchRenderedHtml(TREND_URL, { waitMs: 15000, block: 'image,font' });
       $ = cheerio.load(html);
       results = collectFromDom($);
     }
 
-    // 4) Fallback: analizar JSON embebido
+    // 4) Fallback: JSON embebido
     if (results.length === 0) {
       const acc = new Set();
       for (const raw of jsonBlocksFromScripts($)) {
@@ -188,7 +189,7 @@ app.get('/erank/keywords', async (req, res) => {
   }
 });
 
-// --- /erank/research
+// /erank/research
 app.get('/erank/research', async (req, res) => {
   try {
     const q = String(req.query.q || '').toLowerCase();
@@ -208,7 +209,7 @@ app.get('/erank/research', async (req, res) => {
   }
 });
 
-// --- Etsy público
+// Etsy público
 app.get('/erank/products', async (req, res) => {
   try {
     const q = String(req.query.q || '');
@@ -231,7 +232,7 @@ app.get('/erank/products', async (req, res) => {
   }
 });
 
-// --- Etsy shop listings público
+// Etsy shop público
 app.get('/erank/mylistings', async (req, res) => {
   try {
     const shop = String(req.query.shop || '');
