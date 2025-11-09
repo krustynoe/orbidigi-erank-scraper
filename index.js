@@ -1,3 +1,7 @@
+app.use((req, _res, next) => {
+  req.url = req.url.replace(/\/{2,}/g, '/'); // colapsa // -> /
+  next();
+});
 const express = require('express');
 const axios = require('axios');
 const app = express();
