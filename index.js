@@ -22,22 +22,22 @@ app.get('/erank/healthz',(_req, res) => res.json({ ok: true }));
 
 // --- ENV
 const ZR    = (process.env.ZENROWS_API_KEY || '').trim();
-const ER    = (process.env.ERANK_COOKIES   || '').trim(); // ONE LINE: "name=value; name2=value2; ..."
+const ER    = (process.env.ERANK_COOKIES   || '').trim(); // "name=value; name2=value2; ..."
 const PATH  = (process.env.ERANK_TREND_PATH || 'trends').trim(); // 'trends' or 'trend-buzz'
 const TREND_URL = `https://members.erank.com/${PATH}`;
 const UA    = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36';
 
 const http = axios.create({ timeout: 120000 });
 
-// --- ZenRows helper for rendered HTML with your cookie
-async function fetchRenderedHtml(url, waitMs = 5000) {
+// --- ZenRows helper
+async function fetchRenderedHtml(url, { waitMs = 8000, block = 'image,font,stylesheet' } = {}) {
   const params = {
     apikey: ZR,
     url,
     js_render: 'true',
     custom_headers: 'true',
     premium_proxy: 'true',
-    block_resources: 'image,font,stylesheet',
+    block_resources: block,
     wait: String(waitMs)
   };
   const { data } = await http.get('https://api.zenrows.com/v1/', {
@@ -50,7 +50,7 @@ async function fetchRenderedHtml(url, waitMs = 5000) {
   return html;
 }
 
-// --- helpers to extract keywords
+// --- Helpers extracción
 function collectFromDom($) {
   const out = new Set();
   $('.trend-card .title, [data-testid="trend-title"], .trend-title, h2, h3').each((_, el) => {
@@ -64,36 +64,60 @@ function collectFromDom($) {
   return Array.from(out);
 }
 
-function safeJsonCandidatesFromScripts($) {
-  const texts = [];
+function* jsonBlocksFromScripts($) {
+  // 1) <script type="application/json">...</script>
+  $('script[type="application/json"]').each((_, el) => {
+    const txt = ($(el).html() || '').trim();
+    if (txt) yield txt;
+  });
+  // 2) window.__X = {...}; patterns
   $('script').each((_, el) => {
     const txt = ($(el).html() || '').trim();
     if (!txt) return;
-    // Find window.* = { ... } or [ ... ];
-    const re = /window\.[A-Za-z0-9_$.-]+\s*=\s*([\s\S]+?);[\r\n]/g;
-    let m;
-    while ((m = re.exec(txt))) {
-      const raw = m[1].trim();
-      const first = raw[0];
-      const open = first === '{' ? '{' : first === '[' ? '[' : null;
-      const close = open === '{' ? '}' : open === '[' ? ']' : null;
-      if (!open) continue;
-      let depth = 0, end = -1;
-      for (let i = 0; i < raw.length; i++) {
-        const c = raw[i];
-        if (c === open) depth++;
-        else if (c === close) { depth--; if (depth === 0) { end = i + 1; break; } }
+    const known = [
+      /__NEXT_DATA__\s*=\s*({[\s\S]*?});/,
+      /__NUXT__\s*=\s*({[\s\S]*?});/,
+      /__INITIAL_STATE__\s*=\s*({[\s\S]*?});/,
+      /window\.[A-Za-z0-9_$.-]+\s*=\s*({[\s\S]*?});/
+    ];
+    for (const re of known) {
+      let m;
+      while ((m = re.exec(txt))) {
+        const raw = m[1];
+        const trimmed = balanceJson(raw);
+        if (trimmed) yield trimmed;
       }
-      if (end > 0) texts.push(raw.slice(0, end));
+    }
+    // 3) Arrays
+    const arrRe = /window\.[A-Za-z0-9_$.-]+\s*=\s*(\[[\s\S]*?\]);/g;
+    let m;
+    while ((m = arrRe.exec(txt))) {
+      const raw = m[1];
+      const trimmed = balanceJson(raw);
+      if (trimmed) yield trimmed;
     }
   });
-  return texts;
+}
+
+function balanceJson(raw) {
+  const s = raw.trim();
+  const first = s[0];
+  const open = first === '{' ? '{' : first === '[' ? '[' : null;
+  const close = open === '{' ? '}' : open === '[' ? ']' : null;
+  if (!open) return null;
+  let depth = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === open) depth++;
+    else if (c === close) { depth--; if (depth === 0) return s.slice(0, i + 1); }
+  }
+  return null;
 }
 
 function walkStrings(node, acc) {
   if (typeof node === 'string') {
-    const s = node.trim();
-    if (s && s.length <= 80) acc.add(s);
+    const v = node.trim();
+    if (v && v.length <= 100) acc.add(v);
     return;
   }
   if (Array.isArray(node)) { node.forEach(n => walkStrings(n, acc)); return; }
@@ -109,11 +133,11 @@ function walkStrings(node, acc) {
   }
 }
 
-// --- Debug to see if trends page is accessible and rendered
+// --- Debug
 app.get('/erank/debug', async (req, res) => {
   try {
     const target = String(req.query.url || TREND_URL);
-    const html = await fetchRenderedHtml(target, 5000);
+    const html = await fetchRenderedHtml(target, { waitMs: 8000 });
     const ok = /trend|keyword|h2|h3/i.test(html);
     res.json({ url: target, ok, snippet: html.slice(0, 600) });
   } catch (e) {
@@ -121,27 +145,34 @@ app.get('/erank/debug', async (req, res) => {
   }
 });
 
-// --- /erank/keywords with retry + JSON fallback
+// --- /erank/keywords con retries + JSON fallback
 app.get('/erank/keywords', async (req, res) => {
   try {
     const q = String(req.query.q || '').toLowerCase();
 
-    // 1) try DOM after 5s
-    let html = await fetchRenderedHtml(TREND_URL, 5000);
+    // 1) 8 s con stylesheet bloqueado
+    let html = await fetchRenderedHtml(TREND_URL, { waitMs: 8000, block: 'image,font,stylesheet' });
     let $ = cheerio.load(html);
     let results = collectFromDom($);
 
-    // 2) retry DOM after 10s if empty
+    // 2) 12 s con stylesheet bloqueado
     if (results.length === 0) {
-      html = await fetchRenderedHtml(TREND_URL, 10000);
+      html = await fetchRenderedHtml(TREND_URL, { waitMs: 12000, block: 'image,font,stylesheet' });
       $ = cheerio.load(html);
       results = collectFromDom($);
     }
 
-    // 3) fallback: parse embedded JSON in scripts
+    // 3) 15 s y permitimos stylesheet
+    if (results.length === 0) {
+      html = await fetchRenderedHtml(TREND_URL, { waitMs: 15000, block: 'image,font' });
+      $ = cheerio.load(html);
+      results = collectFromDom($);
+    }
+
+    // 4) Fallback: analizar JSON embebido
     if (results.length === 0) {
       const acc = new Set();
-      for (const raw of safeJsonCandidatesFromScripts($)) {
+      for (const raw of jsonBlocksFromScripts($)) {
         try { walkStrings(JSON.parse(raw), acc); } catch (_) {}
       }
       results = Array.from(acc);
@@ -150,18 +181,18 @@ app.get('/erank/keywords', async (req, res) => {
     if (q) results = results.filter(s => s.toLowerCase().includes(q));
     results = Array.from(new Set(results.map(s => s.trim()))).filter(Boolean);
 
-    res.json({ source: TREND_URL, query: q, count: results.length, results: results.slice(0, 50) });
+    res.json({ source: TREND_URL, query: q, count: results.length, results: results.slice(0, 100) });
   } catch (e) {
     console.error('keywords scrape error:', e.response?.data || e.message || e);
     res.status(502).json({ error: e.response?.data || String(e) });
   }
 });
 
-// --- /erank/research: scrape rendered DOM for cards/titles/links
+// --- /erank/research
 app.get('/erank/research', async (req, res) => {
   try {
     const q = String(req.query.q || '').toLowerCase();
-    const html = await fetchRenderedHtml(TREND_URL, 5000);
+    const html = await fetchRenderedHtml(TREND_URL, { waitMs: 8000, block: 'image,font,stylesheet' });
     const $ = cheerio.load(html);
     const items = [];
     $('.trend-card, [data-testid="trend-card"]').each((_, el) => {
@@ -170,19 +201,19 @@ app.get('/erank/research', async (req, res) => {
       const link  = ($el.find('a').attr('href') || '').trim();
       if (title && (!q || title.toLowerCase().includes(q))) items.push({ title, link });
     });
-    res.json({ source: TREND_URL, query: q, count: items.length, items: items.slice(0, 20) });
+    res.json({ source: TREND_URL, query: q, count: items.length, items: items.slice(0, 50) });
   } catch (e) {
     console.error('research scrape error:', e.response?.data || e.message || e);
     res.status(502).json({ error: e.response?.data || String(e) });
   }
 });
 
-// --- Etsy (público) via ZenRows + Cheerio
+// --- Etsy público
 app.get('/erank/products', async (req, res) => {
   try {
     const q = String(req.query.q || '');
     const url = `https://www.etsy.com/search?q=${encodeURIComponent(q)}`;
-    const html = await fetchRenderedHtml(url, 5000);
+    const html = await fetchRenderedHtml(url, { waitMs: 8000, block: 'image,font,stylesheet' });
     const $ = cheerio.load(html);
     const items = [];
     $('li[data-search-result], .v2-listing-card').each((_, el) => {
@@ -200,13 +231,13 @@ app.get('/erank/products', async (req, res) => {
   }
 });
 
-// Etsy shop listings (public)
+// --- Etsy shop listings público
 app.get('/erank/mylistings', async (req, res) => {
   try {
     const shop = String(req.query.shop || '');
     if (!shop) return res.status(400).json({ error: "Missing 'shop' param" });
     const url = `https://www.etsy.com/shop/${encodeURIComponent(shop)}`;
-    const html = await fetchRenderedHtml(url, 5000);
+    const html = await fetchRenderedHtml(url, { waitMs: 8000, block: 'image,font,stylesheet' });
     const $ = cheerio.load(html);
     const items = [];
     $('.wt-grid__item-xs-6, .v2-listing-card').each((_, el) => {
