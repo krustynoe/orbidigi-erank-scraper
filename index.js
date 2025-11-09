@@ -20,7 +20,7 @@ app.get('/erank/healthz', (_req, res) => res.json({ ok: true }));
 
 // ENV
 const ZR   = (process.env.ZENROWS_API_KEY || '').trim();
-const ER   = (process.env.ERANK_COOKIES   || '').trim();  // cookies en una línea
+const ER   = (process.env.ERANK_COOKIES   || '').trim();  // cookies una línea
 const PATH = (process.env.ERANK_TREND_PATH || 'trend-buzz').trim(); // fallback
 const TREND_URL = `https://members.erank.com/${PATH}`;
 const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36';
@@ -127,13 +127,11 @@ async function callErankApi(apiPath, { q }) {
       const zStatus = r?.status || r?.data?.statusCode || r?.data?.status || 'unknown';
       console.log(`ZenRows fallback attempt wait=${w}ms → status=${zStatus}`);
 
-      // Si ZenRows devuelve JSON real
       if (typeof r.data === 'object' && !('html' in r.data)) return r.data;
       if (typeof r.data === 'string') {
         try { return JSON.parse(r.data); } catch {}
       }
 
-      // Si trae HTML o respuesta inválida, seguimos reintentando
       lastErr = new Error(`ZenRows returned non-JSON (status=${zStatus})`);
     } catch (e) {
       lastErr = e;
@@ -165,7 +163,7 @@ async function fetchRenderedHtml(url, { waitMs = 8000, block = 'image,font,style
   return html;
 }
 
-/* -------------------- Parse genérico -------------------- */
+/* -------------------- Parse genérico y específico -------------------- */
 function gatherStrings(node, acc) {
   if (!node) return;
   if (typeof node === 'string') { const s = node.trim(); if (s) acc.add(s); return; }
@@ -177,6 +175,32 @@ function gatherStrings(node, acc) {
       else gatherStrings(v, acc);
     }
   }
+}
+
+function extractKnownKeywords(payload) {
+  const out = [];
+  const push = (v) => { if (typeof v === 'string') { const s = v.trim(); if (s) out.push(s); } };
+  const takeTitle = (o) => {
+    if (!o || typeof o !== 'object') return;
+    const t = o.title || o.name || o.keyword || o.term || o.text;
+    if (typeof t === 'string') push(t);
+  };
+
+  if (Array.isArray(payload)) payload.forEach(takeTitle);
+
+  const roots = ['trends','buzz','keywords','results','items','data','list','records'];
+  roots.forEach(k => {
+    const v = payload?.[k];
+    if (Array.isArray(v)) v.forEach(takeTitle);
+    if (v && typeof v === 'object') {
+      if (Array.isArray(v.data)) v.data.forEach(takeTitle);
+      if (Array.isArray(v.items)) v.items.forEach(takeTitle);
+    }
+  });
+
+  if (Array.isArray(payload?.data?.data)) payload.data.data.forEach(takeTitle);
+
+  return Array.from(new Set(out.filter(Boolean)));
 }
 
 /* -------------------- Endpoints -------------------- */
@@ -211,8 +235,13 @@ app.get('/erank/keywords', async (req, res) => {
     const api = callErankApi.bind({ csrf, xsrf, dal });
     const data = await api(apiPath, { q });
 
-    const acc = new Set(); gatherStrings(data, acc);
-    let results = Array.from(acc); if (q) results = results.filter(s => s.toLowerCase().includes(q));
+    let results = extractKnownKeywords(data);
+    if (results.length === 0) {
+      const acc = new Set(); gatherStrings(data, acc);
+      results = Array.from(acc);
+    }
+    if (q) results = results.filter(s => s.toLowerCase().includes(q));
+
     res.json({ source: `https://members.erank.com/${apiPath}`, query: q, count: results.length, results: results.slice(0, 100) });
   } catch (e) {
     console.error('keywords error:', e.response?.data || e.message || e);
@@ -230,21 +259,52 @@ app.get('/erank/research', async (req, res) => {
     const data = await api(apiPath, { q });
 
     const items = [];
-    const walk = (node) => {
-      if (!node) return;
-      if (Array.isArray(node)) { node.forEach(walk); return; }
-      if (typeof node === 'object') {
-        const title = (node.title || node.name || node.keyword || '').toString().trim();
-        const link  = (node.url || node.link || '').toString().trim();
-        if (title && (!q || title.toLowerCase().includes(q))) items.push({ title, link });
-        for (const k of Object.keys(node)) walk(node[k]);
+    const sources = [data?.trends, data?.buzz, data?.items, data?.results, data?.data?.data];
+    for (const arr of sources) {
+      if (Array.isArray(arr)) {
+        arr.forEach(o => {
+          if (!o || typeof o !== 'object') return;
+          const title = (o.title || o.name || o.keyword || o.term || '').toString().trim();
+          const link  = (o.url || o.link || '').toString().trim();
+          if (title && (!q || title.toLowerCase().includes(q))) items.push({ title, link });
+        });
       }
-    };
-    walk(data);
+    }
+    if (items.length === 0) {
+      const walk = (node) => {
+        if (!node) return;
+        if (Array.isArray(node)) { node.forEach(walk); return; }
+        if (typeof node === 'object') {
+          const title = (node.title || node.name || node.keyword || '').toString().trim();
+          const link  = (node.url || node.link || '').toString().trim();
+          if (title && (!q || title.toLowerCase().includes(q))) items.push({ title, link });
+          for (const k of Object.keys(node)) walk(node[k]);
+        }
+      };
+      walk(data);
+    }
 
     res.json({ source: `https://members.erank.com/${apiPath}`, query: q, count: items.length, items: items.slice(0, 50) });
   } catch (e) {
     console.error('research error:', e.response?.data || e.message || e);
+    res.status(502).json({ error: e.response?.data || String(e) });
+  }
+});
+
+// Vista previa del JSON crudo del API
+app.get('/erank/raw', async (_req, res) => {
+  try {
+    const html = await fetchErankPage();
+    const { csrf, xsrf, dal, apiPath } = extractAuthFromHtml(html);
+    const api = callErankApi.bind({ csrf, xsrf, dal });
+    const data = await api(apiPath, {});
+    res.json({
+      apiPath,
+      typeof: typeof data,
+      keys: data && typeof data === 'object' ? Object.keys(data).slice(0, 20) : [],
+      preview: JSON.stringify(data).slice(0, 1200)
+    });
+  } catch (e) {
     res.status(502).json({ error: e.response?.data || String(e) });
   }
 });
