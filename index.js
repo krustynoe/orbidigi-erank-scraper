@@ -1,4 +1,5 @@
-// index.js — eRank API autodetect + CSRF/XSRF + ZenRows fallback for API + Etsy
+// index.js — eRank API autodetect + CSRF/XSRF/JWT
+// Fallback del API vía ZenRows con JS render, reintentos y logging.
 // Node 18, CommonJS, para Render.
 
 globalThis.File = globalThis.File || class File {};
@@ -19,7 +20,7 @@ app.get('/erank/healthz', (_req, res) => res.json({ ok: true }));
 
 // ENV
 const ZR   = (process.env.ZENROWS_API_KEY || '').trim();
-const ER   = (process.env.ERANK_COOKIES   || '').trim();  // cookies una línea
+const ER   = (process.env.ERANK_COOKIES   || '').trim();  // cookies en una línea
 const PATH = (process.env.ERANK_TREND_PATH || 'trend-buzz').trim(); // fallback
 const TREND_URL = `https://members.erank.com/${PATH}`;
 const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36';
@@ -97,32 +98,49 @@ async function callErankApi(apiPath, { q }) {
     const { data } = await http.get(fullUrl, { headers });
     return data;
   } catch (e) {
-    if (e?.response?.status !== 403) throw e;
+    const sc = e?.response?.status;
+    if (sc && sc !== 403) throw e;
+    console.warn('direct API call failed with status:', sc || 'unknown');
   }
 
-  // 2) fallback por ZenRows con JS render (genera tokens) y headers completos
-  const zrParams = {
-    apikey: ZR,
-    url: fullUrl,
-    custom_headers: 'true',
-    premium_proxy: 'true',
-    js_render: 'true',
-    block_resources: 'image,font,stylesheet',
-    wait: '5000'
-  };
-  const { data } = await http.get('https://api.zenrows.com/v1/', {
-    params: zrParams,
-    headers,
-    timeout: 120000
-  });
+  // 2) fallback por ZenRows con JS render, sin bloquear recursos, reintentos
+  const waits = [8000, 12000, 15000];
+  let lastErr;
+  for (const w of waits) {
+    try {
+      const zrParams = {
+        apikey: ZR,
+        url: fullUrl,
+        custom_headers: 'true',
+        premium_proxy: 'true',
+        js_render: 'true',
+        wait: String(w),
+        render_attempts: '2'
+      };
+      const r = await http.get('https://api.zenrows.com/v1/', {
+        params: zrParams,
+        headers,
+        timeout: 120000,
+        validateStatus: () => true
+      });
 
-  if (typeof data === 'object' && data && 'html' in data) {
-    throw new Error('ZenRows returned HTML for API call');
+      const zStatus = r?.status || r?.data?.statusCode || r?.data?.status || 'unknown';
+      console.log(`ZenRows fallback attempt wait=${w}ms → status=${zStatus}`);
+
+      // Si ZenRows devuelve JSON real
+      if (typeof r.data === 'object' && !('html' in r.data)) return r.data;
+      if (typeof r.data === 'string') {
+        try { return JSON.parse(r.data); } catch {}
+      }
+
+      // Si trae HTML o respuesta inválida, seguimos reintentando
+      lastErr = new Error(`ZenRows returned non-JSON (status=${zStatus})`);
+    } catch (e) {
+      lastErr = e;
+      console.warn(`ZenRows attempt with wait=${w}ms failed:`, e?.response?.status || e.message);
+    }
   }
-  if (typeof data === 'string') {
-    try { return JSON.parse(data); } catch { /* sigue abajo */ }
-  }
-  return data;
+  throw lastErr || new Error('ZenRows fallback failed');
 }
 
 /* -------------------- ZenRows HTML (debug/Etsy) -------------------- */
@@ -243,7 +261,7 @@ app.get('/erank/products', async (req, res) => {
       const $el = $(el);
       const title = ($el.find('h3, [data-test="listing-title"], [data-test="listing-card-title"]').first().text() || '').trim();
       const link  = ($el.find('a').attr('href') || '').trim();
-      const price = ($el.find('.currency-value, [data-buy-box-listing-price"]').first().text() || '').trim();
+      const price = ($el.find('.currency-value, [data-buy-box-listing-price]').first().text() || '').trim();
       const shop  = ($el.find('.v2-listing-card__shop, .text-body-secondary, .text-body-small').first().text() || '').trim();
       if (title || link) items.push({ title, url: link, price, shop });
     });
