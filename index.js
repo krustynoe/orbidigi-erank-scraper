@@ -1,11 +1,12 @@
 // index.js — eRank API autodetect + CSRF/XSRF + ZenRows fallback for API + Etsy
-// Node 18 CJS para Render.
+// Node 18, CommonJS, para Render.
 
 globalThis.File = globalThis.File || class File {};
 
 const express = require('express');
 const axios   = require('axios');
 const cheerio = require('cheerio');
+
 const app  = express();
 const port = process.env.PORT || 3000;
 
@@ -18,8 +19,8 @@ app.get('/erank/healthz', (_req, res) => res.json({ ok: true }));
 
 // ENV
 const ZR   = (process.env.ZENROWS_API_KEY || '').trim();
-const ER   = (process.env.ERANK_COOKIES   || '').trim(); // cookies una línea
-const PATH = (process.env.ERANK_TREND_PATH || 'trend-buzz').trim(); // default a trend-buzz
+const ER   = (process.env.ERANK_COOKIES   || '').trim();  // cookies una línea
+const PATH = (process.env.ERANK_TREND_PATH || 'trend-buzz').trim(); // fallback
 const TREND_URL = `https://members.erank.com/${PATH}`;
 const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36';
 
@@ -43,23 +44,30 @@ async function fetchErankPage() {
   if (typeof html !== 'string') throw new Error('No HTML');
   return html;
 }
+
 function extractAuthFromHtml(html) {
   const $ = cheerio.load(html);
   const csrf = $('meta[name="csrf-token"]').attr('content') || '';
   const xsrf = getCookie('XSRF-TOKEN') || getCookie('xsrf-token') || '';
+
+  // JWT
   let dal = '';
   const ctx = html.match(/window\.APP_CONTEXT\s*=\s*(\{[\s\S]*?\});/);
   if (ctx) { try { dal = JSON.parse(ctx[1]).DAL_TOKEN || ''; } catch {} }
+
+  // Ziggy → endpoint API
   let apiPath = '';
   const zig = html.match(/const\s+Ziggy\s*=\s*(\{[\s\S]*?\});/);
   if (zig) {
     try {
-      const z = JSON.parse(zig[1]); const routes = z?.routes || {};
+      const z = JSON.parse(zig[1]);
+      const routes = z?.routes || {};
       const key = Object.keys(routes).find(k => /^api\./.test(k) && /trend/i.test(k));
-      if (key && routes[key]?.uri) apiPath = routes[key].uri; // ej: api/trend-buzz
+      if (key && routes[key]?.uri) apiPath = routes[key].uri; // p.ej. "api/trend-buzz"
     } catch {}
   }
   if (!apiPath) apiPath = `api/${PATH}`;
+
   return { csrf, xsrf, dal, apiPath };
 }
 
@@ -92,13 +100,15 @@ async function callErankApi(apiPath, { q }) {
     if (e?.response?.status !== 403) throw e;
   }
 
-  // 2) fallback via ZenRows sin render, con custom headers y URL completa
+  // 2) fallback por ZenRows con JS render (genera tokens) y headers completos
   const zrParams = {
     apikey: ZR,
     url: fullUrl,
     custom_headers: 'true',
     premium_proxy: 'true',
-    js_render: 'false'
+    js_render: 'true',
+    block_resources: 'image,font,stylesheet',
+    wait: '5000'
   };
   const { data } = await http.get('https://api.zenrows.com/v1/', {
     params: zrParams,
@@ -106,17 +116,27 @@ async function callErankApi(apiPath, { q }) {
     timeout: 120000
   });
 
-  // Si ZenRows envolvió JSON dentro de html, tratarlo como error
-  if (data && typeof data === 'object' && 'html' in data) {
+  if (typeof data === 'object' && data && 'html' in data) {
     throw new Error('ZenRows returned HTML for API call');
+  }
+  if (typeof data === 'string') {
+    try { return JSON.parse(data); } catch { /* sigue abajo */ }
   }
   return data;
 }
 
 /* -------------------- ZenRows HTML (debug/Etsy) -------------------- */
 async function fetchRenderedHtml(url, { waitMs = 8000, block = 'image,font,stylesheet' } = {}) {
-  const params = { apikey: ZR, url, js_render: 'true', custom_headers: 'true', premium_proxy: 'true', wait: String(waitMs) };
+  const params = {
+    apikey: ZR,
+    url,
+    js_render: 'true',
+    custom_headers: 'true',
+    premium_proxy: 'true',
+    wait: String(waitMs)
+  };
   if (block) params.block_resources = block;
+
   const { data } = await http.get('https://api.zenrows.com/v1/', {
     params,
     headers: { 'User-Agent': UA, ...(ER ? { Cookie: ER } : {}) },
@@ -143,19 +163,28 @@ function gatherStrings(node, acc) {
 
 /* -------------------- Endpoints -------------------- */
 app.get('/erank/debug', async (_req, res) => {
-  try { const html = await fetchRenderedHtml(TREND_URL, { waitMs: 8000 }); res.json({ ok: /<html/i.test(html), snippet: html.slice(0, 600) }); }
-  catch (e) { res.status(502).json({ error: e.response?.data || String(e) }); }
+  try {
+    const html = await fetchRenderedHtml(TREND_URL, { waitMs: 8000 });
+    res.json({ ok: /<html/i.test(html), snippet: html.slice(0, 600) });
+  } catch (e) {
+    res.status(502).json({ error: e.response?.data || String(e) });
+  }
 });
 
 app.get('/erank/inspect', async (_req, res) => {
   try {
     const html = await fetchRenderedHtml(TREND_URL, { waitMs: 8000 });
-    const $ = cheerio.load(html); const scripts = [];
-    $('script').each((i, el) => { const txt = ($(el).html() || '').trim(); scripts.push({ i, len: txt.length, head: txt.slice(0, 160) }); });
+    const $ = cheerio.load(html);
+    const scripts = [];
+    $('script').each((i, el) => {
+      const txt = ($(el).html() || '').trim();
+      scripts.push({ i, len: txt.length, head: txt.slice(0, 160) });
+    });
     res.json({ source: TREND_URL, scripts: scripts.slice(0, 20) });
   } catch (e) { res.status(502).json({ error: e.response?.data || String(e) }); }
 });
 
+// Keywords
 app.get('/erank/keywords', async (req, res) => {
   try {
     const q = String(req.query.q || '').toLowerCase();
@@ -163,12 +192,17 @@ app.get('/erank/keywords', async (req, res) => {
     const { csrf, xsrf, dal, apiPath } = extractAuthFromHtml(html);
     const api = callErankApi.bind({ csrf, xsrf, dal });
     const data = await api(apiPath, { q });
+
     const acc = new Set(); gatherStrings(data, acc);
     let results = Array.from(acc); if (q) results = results.filter(s => s.toLowerCase().includes(q));
     res.json({ source: `https://members.erank.com/${apiPath}`, query: q, count: results.length, results: results.slice(0, 100) });
-  } catch (e) { console.error('keywords error:', e.response?.data || e.message || e); res.status(502).json({ error: e.response?.data || String(e) }); }
+  } catch (e) {
+    console.error('keywords error:', e.response?.data || e.message || e);
+    res.status(502).json({ error: e.response?.data || String(e) });
+  }
 });
 
+// Research
 app.get('/erank/research', async (req, res) => {
   try {
     const q = String(req.query.q || '').toLowerCase();
@@ -176,6 +210,7 @@ app.get('/erank/research', async (req, res) => {
     const { csrf, xsrf, dal, apiPath } = extractAuthFromHtml(html);
     const api = callErankApi.bind({ csrf, xsrf, dal });
     const data = await api(apiPath, { q });
+
     const items = [];
     const walk = (node) => {
       if (!node) return;
@@ -188,16 +223,22 @@ app.get('/erank/research', async (req, res) => {
       }
     };
     walk(data);
+
     res.json({ source: `https://members.erank.com/${apiPath}`, query: q, count: items.length, items: items.slice(0, 50) });
-  } catch (e) { console.error('research error:', e.response?.data || e.message || e); res.status(502).json({ error: e.response?.data || String(e) }); }
+  } catch (e) {
+    console.error('research error:', e.response?.data || e.message || e);
+    res.status(502).json({ error: e.response?.data || String(e) });
+  }
 });
 
 /* -------------------- Etsy público -------------------- */
 app.get('/erank/products', async (req, res) => {
   try {
-    const q = String(req.query.q || ''); const url = `https://www.etsy.com/search?q=${encodeURIComponent(q)}`;
+    const q = String(req.query.q || '');
+    const url = `https://www.etsy.com/search?q=${encodeURIComponent(q)}`;
     const html = await fetchRenderedHtml(url, { waitMs: 8000, block: 'image,font,stylesheet' });
-    const $ = cheerio.load(html); const items = [];
+    const $ = cheerio.load(html);
+    const items = [];
     $('li[data-search-result], .v2-listing-card').each((_, el) => {
       const $el = $(el);
       const title = ($el.find('h3, [data-test="listing-title"], [data-test="listing-card-title"]').first().text() || '').trim();
@@ -207,12 +248,16 @@ app.get('/erank/products', async (req, res) => {
       if (title || link) items.push({ title, url: link, price, shop });
     });
     res.json({ query: q, count: items.length, items: items.slice(0, 20) });
-  } catch (e) { console.error('products error:', e.response?.data || e.message || e); res.status(502).json({ error: e.response?.data || String(e) }); }
+  } catch (e) {
+    console.error('products error:', e.response?.data || e.message || e);
+    res.status(502).json({ error: e.response?.data || String(e) });
+  }
 });
 
 /* -------------------- Listen -------------------- */
 app.listen(port, '0.0.0.0', () => {
   const routes = [];
   app._router?.stack.forEach(mw => { if (mw.route) routes.push(Object.keys(mw.route.methods).join(',').toUpperCase() + ' ' + mw.route.path); });
-  console.log('ROUTES:', routes); console.log('listening on', port);
+  console.log('ROUTES:', routes);
+  console.log('listening on', port);
 });
