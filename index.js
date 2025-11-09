@@ -1,6 +1,6 @@
-// index.js (CommonJS) — eRank con Cheerio sobre HTML de ZenRows
+// index.js (CommonJS) — eRank via ZenRows (HTML) + Cheerio
 
-// 1) Polyfill antes de axios (evita "File is not defined" de undici)
+// Polyfill antes de axios (evita "File is not defined" de undici en Node 18)
 globalThis.File = globalThis.File || class File {};
 
 const express = require('express');
@@ -10,7 +10,7 @@ const cheerio = require('cheerio');
 const app  = express();
 const port = process.env.PORT || 3000;
 
-// Normaliza dobles barras (// -> /)
+// Normaliza dobles barras // -> /
 app.use((req, _res, next) => {
   if (req.url.includes('//')) req.url = req.url.replace(/\/{2,}/g, '/');
   next();
@@ -26,34 +26,74 @@ function headersWithCookie(cookie) {
   return { 'User-Agent': 'Mozilla/5.0', ...(cookie ? { Cookie: cookie } : {}) };
 }
 
-// Trae HTML renderizado con ZenRows; sin css_extractor para evitar REQS004
+// ZenRows -> HTML (sin css_extractor). Timeout alto y proxy premium opcional.
 async function fetchHtml(url, cookie = '', waitFor = 'body') {
   const params = {
     apikey: ZR,
     url,
     js_render: 'true',
     custom_headers: 'true',
-    wait_for: waitFor,
-    // premium_proxy: 'true',  // descomenta si el sitio protege fuerte
-    // block_resources: 'true'
+    premium_proxy: 'true',     // recomendado en sitios protegidos
+    block_resources: 'true',
+    wait_for: waitFor
   };
   const { data } = await axios.get('https://api.zenrows.com/v1/', {
     params,
     headers: headersWithCookie(cookie),
-    timeout: 90000
+    timeout: 120000
   });
   if (typeof data === 'string') return data;
   if (data?.html) return data.html;
   throw new Error(JSON.stringify(data));
 }
 
+// Detecta si el HTML es 404/login
+function looksLike404OrLogin(html) {
+  const s = String(html || '').toLowerCase();
+  return s.includes('page you were looking for was not found')
+      || s.includes('sorry, the page you were looking for was not found')
+      || s.includes('sign in') || s.includes('login');
+}
+
+// Candidatas para Trend Buzz (ajusta si tu cuenta usa otra ruta)
+const TREND_CANDIDATES = [
+  'https://members.erank.com/trend-buzz',
+  'https://members.erank.com/trends',
+  'https://members.erank.com/keyword-trends',
+  'https://members.erank.com/trendbuzz'
+];
+
+// Prueba candidatas hasta encontrar una con contenido válido
+async function resolveTrendUrl(cookie) {
+  for (const u of TREND_CANDIDATES) {
+    try {
+      const html = await fetchHtml(u, cookie, 'body');
+      if (html && !looksLike404OrLogin(html)) return { url: u, html };
+    } catch (_) { /* sigue probando */ }
+  }
+  return { url: null, html: null };
+}
+
+// Diagnóstico rápido: /erank/debug?url=<destino>
+app.get('/erank/debug', async (req, res) => {
+  try {
+    const u = String(req.query.url || 'https://members.erank.com/trend-buzz');
+    const html = await fetchHtml(u, ER, 'body');
+    res.json({ url: u, ok: !looksLike404OrLogin(html), snippet: String(html || '').slice(0, 500) });
+  } catch (e) {
+    res.status(500).json({ error: e.response?.data || String(e) });
+  }
+});
+
 /* ---------------- RUTAS ERANK ---------------- */
 
-// /erank/keywords -> { query, count, results[] }
+// 1) Tendencias -> { source, query, count, results[] }
 app.get('/erank/keywords', async (req, res) => {
   try {
     const q = String(req.query.q || '');
-    const html = await fetchHtml('https://members.erank.com/trend-buzz', ER, 'body');
+    const { url, html } = await resolveTrendUrl(ER);
+    if (!url) return res.status(502).json({ error: 'No trend page found (login/404)' });
+
     const $ = cheerio.load(html);
     const set = new Set();
     $('.trend-card .title, .trend, [data-testid="trend"], h1, h2, h3').each((_, el) => {
@@ -61,22 +101,18 @@ app.get('/erank/keywords', async (req, res) => {
       if (t) set.add(t);
     });
     const results = Array.from(set);
-    res.json({ query: q, count: results.length, results: results.slice(0, 20) });
+    res.json({ source: url, query: q, count: results.length, results: results.slice(0, 20) });
   } catch (e) {
     console.error('keywords error:', e.response?.data || e.message || e);
     res.status(500).json({ error: e.response?.data || String(e) });
   }
 });
 
-// /erank/products -> ejemplo público (Etsy) { query, count, items[] }
+// 2) Productos (Etsy público) -> { query, count, items[] }
 app.get('/erank/products', async (req, res) => {
   try {
     const q = String(req.query.q || '');
-    const html = await fetchHtml(
-      `https://www.etsy.com/search?q=${encodeURIComponent(q)}`,
-      '',
-      'li[data-search-result]'
-    );
+    const html = await fetchHtml(`https://www.etsy.com/search?q=${encodeURIComponent(q)}`, '', 'li[data-search-result]');
     const $ = cheerio.load(html);
     const items = [];
     $('li[data-search-result]').each((_, el) => {
@@ -94,17 +130,13 @@ app.get('/erank/products', async (req, res) => {
   }
 });
 
-// /erank/mylistings -> Etsy shop pública { shop, count, items[] }
+// 3) Listados de una tienda (Etsy) -> { shop, count, items[] }
 app.get('/erank/mylistings', async (req, res) => {
   try {
     const shop = String(req.query.shop || '');
     if (!shop) return res.status(400).json({ error: "Missing 'shop' param" });
 
-    const html = await fetchHtml(
-      `https://www.etsy.com/shop/${encodeURIComponent(shop)}`,
-      '',
-      '.wt-grid__item-xs-6, .v2-listing-card'
-    );
+    const html = await fetchHtml(`https://www.etsy.com/shop/${encodeURIComponent(shop)}`, '', '.wt-grid__item-xs-6, .v2-listing-card');
     const $ = cheerio.load(html);
     const items = [];
     $('.wt-grid__item-xs-6, .v2-listing-card').each((_, el) => {
@@ -122,15 +154,13 @@ app.get('/erank/mylistings', async (req, res) => {
   }
 });
 
-// /erank/research -> tarjetas en trend-buzz { query, count, items[] }
+// 4) Research (tarjetas de tendencias) -> { source, query, count, items[] }
 app.get('/erank/research', async (req, res) => {
   try {
     const q = String(req.query.q || '');
-    const html = await fetchHtml(
-      'https://members.erank.com/trend-buzz',
-      ER,
-      '.trend-card, .card, [data-testid="trend-card"]'
-    );
+    const { url, html } = await resolveTrendUrl(ER);
+    if (!url) return res.status(502).json({ error: 'No trend page found (login/404)' });
+
     const $ = cheerio.load(html);
     const items = [];
     $('.trend-card, .card, [data-testid="trend-card"]').each((_, el) => {
@@ -139,7 +169,7 @@ app.get('/erank/research', async (req, res) => {
       const link  = ($el.find('a').attr('href') || '').trim();
       if (title) items.push({ title, link });
     });
-    res.json({ query: q, count: items.length, items: items.slice(0, 20) });
+    res.json({ source: url, query: q, count: items.length, items: items.slice(0, 20) });
   } catch (e) {
     console.error('research error:', e.response?.data || e.message || e);
     res.status(500).json({ error: e.response?.data || String(e) });
