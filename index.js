@@ -28,7 +28,7 @@ const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 
 const http = axios.create({ timeout: 120000 });
 
-// ZenRows helper
+// ZenRows helper (solo envía block_resources si existe)
 async function fetchRenderedHtml(url, { waitMs = 8000, block = 'image,font,stylesheet' } = {}) {
   const params = {
     apikey: ZR,
@@ -36,9 +36,10 @@ async function fetchRenderedHtml(url, { waitMs = 8000, block = 'image,font,style
     js_render: 'true',
     custom_headers: 'true',
     premium_proxy: 'true',
-    block_resources: block,
     wait: String(waitMs)
   };
+  if (block) params.block_resources = block; // evita '' inválido
+
   const { data } = await http.get('https://api.zenrows.com/v1/', {
     params,
     headers: { 'User-Agent': UA, ...(ER ? { Cookie: ER } : {}) },
@@ -72,7 +73,7 @@ function jsonBlocksFromScripts($) {
     if (txt) out.push(txt);
   });
 
-  // 2) window.__X = {...}; y arrays
+  // 2) window.__X = {...} o arrays
   $('script').each((_, el) => {
     const txt = ($(el).html() || '').trim();
     if (!txt) return;
@@ -151,21 +152,21 @@ app.get('/erank/keywords', async (req, res) => {
   try {
     const q = String(req.query.q || '').toLowerCase();
 
-    // 1) 8 s con stylesheet bloqueado
+    // 1) 8 s bloqueando imágenes, fuentes y CSS
     let html = await fetchRenderedHtml(TREND_URL, { waitMs: 8000, block: 'image,font,stylesheet' });
     let $ = cheerio.load(html);
     let results = collectFromDom($);
 
-    // 2) 12 s con stylesheet bloqueado
+    // 2) 12 s con mismo bloqueo
     if (results.length === 0) {
       html = await fetchRenderedHtml(TREND_URL, { waitMs: 12000, block: 'image,font,stylesheet' });
       $ = cheerio.load(html);
       results = collectFromDom($);
     }
 
-    // 3) 15 s permitiendo stylesheet (sin bloqueos)
+    // 3) 15 s y SIN bloquear nada (no enviar block_resources)
     if (results.length === 0) {
-      html = await fetchRenderedHtml(TREND_URL, { waitMs: 15000, block: '' });
+      html = await fetchRenderedHtml(TREND_URL, { waitMs: 15000, block: null });
       $ = cheerio.load(html);
       results = collectFromDom($);
     }
@@ -189,10 +190,10 @@ app.get('/erank/keywords', async (req, res) => {
   }
 });
 
-// /erank/inspect: introspección de scripts y títulos
+// /erank/inspect
 app.get('/erank/inspect', async (_req, res) => {
   try {
-    const html = await fetchRenderedHtml(TREND_URL, { waitMs: 15000, block: '' });
+    const html = await fetchRenderedHtml(TREND_URL, { waitMs: 15000, block: null });
     const $ = cheerio.load(html);
     const scripts = [];
     $('script').each((i, el) => {
