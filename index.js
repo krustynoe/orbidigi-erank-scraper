@@ -22,7 +22,7 @@ app.get('/erank/healthz',(_req, res) => res.json({ ok: true }));
 
 // --- ENV
 const ZR    = (process.env.ZENROWS_API_KEY || '').trim();
-const ER    = (process.env.ERANK_COOKIES   || '').trim(); // ONE LINE: "name=value; name2=value2; ..."
+const ER    = (process.env.ERANK_COOKIES   || '').trim(); // "name=value; name2=value2; ..."
 const PATH  = (process.env.ERANK_TREND_PATH || 'trends').trim(); // 'trends' or 'trend-buzz'
 const TREND_URL = `https://members.erank.com/${PATH}`;
 const UA    = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36';
@@ -35,22 +35,24 @@ async function fetchRenderedHtml(url) {
     apikey: ZR,
     url,
     js_render: 'true',
-    custom_headers: 'true', // allows forwarding cookies
+    custom_headers: 'true',
     premium_proxy: 'true',
     block_resources: 'image,font,stylesheet',
-    wait: '5000' // fixed 5s wait to avoid timeouts
+    wait: '5000'
   };
+
   const { data } = await http.get('https://api.zenrows.com/v1/', {
     params,
     headers: { 'User-Agent': UA, ...(ER ? { Cookie: ER } : {}) },
     timeout: 120000
   });
+
   const html = typeof data === 'string' ? data : (data?.html || '');
   if (!html) throw new Error(`Empty HTML from renderer for ${url}`);
   return html;
 }
 
-// --- Debug to see if trends page is accessible and rendered
+// --- Debug endpoint
 app.get('/erank/debug', async (req, res) => {
   try {
     const target = String(req.query.url || TREND_URL);
@@ -62,7 +64,7 @@ app.get('/erank/debug', async (req, res) => {
   }
 });
 
-// --- /erank/keywords: scrape rendered DOM (no API/CSRF)
+// --- /erank/keywords
 app.get('/erank/keywords', async (req, res) => {
   try {
     const q = String(req.query.q || '').toLowerCase();
@@ -90,7 +92,7 @@ app.get('/erank/keywords', async (req, res) => {
   }
 });
 
-// --- /erank/research: scrape rendered DOM for cards/titles/links
+// --- /erank/research
 app.get('/erank/research', async (req, res) => {
   try {
     const q = String(req.query.q || '').toLowerCase();
@@ -114,7 +116,7 @@ app.get('/erank/research', async (req, res) => {
   }
 });
 
-// --- Etsy (público)
+// --- /erank/products (Etsy público)
 app.get('/erank/products', async (req, res) => {
   try {
     const q = String(req.query.q || '');
@@ -137,7 +139,7 @@ app.get('/erank/products', async (req, res) => {
   }
 });
 
-// --- Etsy shop listings (public)
+// --- /erank/mylistings (Etsy shop público)
 app.get('/erank/mylistings', async (req, res) => {
   try {
     const shop = String(req.query.shop || '');
@@ -167,5 +169,5 @@ app.listen(port, '0.0.0.0', () => {
     if (mw.route) routes.push(Object.keys(mw.route.methods).join(',').toUpperCase() + ' ' + mw.route.path); 
   });
   console.log('ROUTES:', routes);
-  console.log('listening on', port);
+  console.log('Your service is live on port', port);
 });
