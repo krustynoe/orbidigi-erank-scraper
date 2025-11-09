@@ -94,5 +94,19 @@ app.get('/erank/research', async (req, res) => {
     res.json({ query: q, count: items.length, items: items.slice(0, 20) });
   } catch (e) { res.status(500).json({ error: e.response?.data || String(e) }); }
 });
+app.get('/healthz', (req, res) => res.json({ ok: true }));
+
+function logRoutes() {
+  const routes = [];
+  app._router.stack.forEach(mw => {
+    if (mw.route) {
+      routes.push(Object.keys(mw.route.methods).join(',').toUpperCase() + ' ' + mw.route.path);
+    } else if (mw.name === 'router' && mw.handle.stack) {
+      mw.handle.stack.forEach(h => h.route && routes.push(Object.keys(h.route.methods).join(',').toUpperCase() + ' ' + h.route.path));
+    }
+  });
+  console.log('ROUTES:', routes);
+}
+logRoutes();
 
 app.listen(port, () => console.log('eRank scraper listening on', port));
