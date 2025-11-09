@@ -163,9 +163,9 @@ app.get('/erank/keywords', async (req, res) => {
       results = collectFromDom($);
     }
 
-    // 3) 15 s permitiendo stylesheet
+    // 3) 15 s permitiendo stylesheet (sin bloqueos)
     if (results.length === 0) {
-      html = await fetchRenderedHtml(TREND_URL, { waitMs: 15000, block: 'image,font' });
+      html = await fetchRenderedHtml(TREND_URL, { waitMs: 15000, block: '' });
       $ = cheerio.load(html);
       results = collectFromDom($);
     }
@@ -185,6 +185,23 @@ app.get('/erank/keywords', async (req, res) => {
     res.json({ source: TREND_URL, query: q, count: results.length, results: results.slice(0, 100) });
   } catch (e) {
     console.error('keywords scrape error:', e.response?.data || e.message || e);
+    res.status(502).json({ error: e.response?.data || String(e) });
+  }
+});
+
+// /erank/inspect: introspección de scripts y títulos
+app.get('/erank/inspect', async (_req, res) => {
+  try {
+    const html = await fetchRenderedHtml(TREND_URL, { waitMs: 15000, block: '' });
+    const $ = cheerio.load(html);
+    const scripts = [];
+    $('script').each((i, el) => {
+      const txt = ($(el).html() || '').trim();
+      scripts.push({ i, len: txt.length, head: txt.slice(0, 120) });
+    });
+    const titles = collectFromDom($);
+    res.json({ source: TREND_URL, scripts: scripts.slice(0, 20), titles: titles.slice(0, 20) });
+  } catch (e) {
     res.status(502).json({ error: e.response?.data || String(e) });
   }
 });
