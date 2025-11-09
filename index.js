@@ -20,7 +20,7 @@ app.get('/erank/healthz', (_req, res) => res.json({ ok: true }));
 
 // ENV
 const ZR   = (process.env.ZENROWS_API_KEY || '').trim();
-const ER   = (process.env.ERANK_COOKIES   || '').trim();  // cookies una línea
+const ER   = (process.env.ERANK_COOKIES   || '').trim();  // cookies en una línea
 const PATH = (process.env.ERANK_TREND_PATH || 'trend-buzz').trim(); // fallback
 const TREND_URL = `https://members.erank.com/${PATH}`;
 const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36';
@@ -114,8 +114,7 @@ async function callErankApi(apiPath, { q }) {
         custom_headers: 'true',
         premium_proxy: 'true',
         js_render: 'true',
-        wait: String(w),
-        render_attempts: '2'
+        wait: String(w)
       };
       const r = await http.get('https://api.zenrows.com/v1/', {
         params: zrParams,
@@ -126,6 +125,12 @@ async function callErankApi(apiPath, { q }) {
 
       const zStatus = r?.status || r?.data?.statusCode || r?.data?.status || 'unknown';
       console.log(`ZenRows fallback attempt wait=${w}ms → status=${zStatus}`);
+
+      // ZenRows puede devolver JSON de error {code,...}. Detecta y reintenta.
+      if (r?.data && typeof r.data === 'object' && (r.data.code || r.data.error)) {
+        lastErr = new Error(`ZenRows error: ${r.data.title || r.data.code || zStatus}`);
+        continue;
+      }
 
       if (typeof r.data === 'object' && !('html' in r.data)) return r.data;
       if (typeof r.data === 'string') {
