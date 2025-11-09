@@ -1,4 +1,4 @@
-// index.js — eRank via JSON API + ZenRows fallback. CommonJS for Node 18 on Render.
+// index.js — eRank via JSON API autodetect (Ziggy) + ZenRows fallback
 
 globalThis.File = globalThis.File || class File {};
 
@@ -9,7 +9,6 @@ const cheerio = require('cheerio');
 const app  = express();
 const port = process.env.PORT || 3000;
 
-// Normaliza // en paths
 app.use((req, _res, next) => {
   if (req.url.includes('//')) req.url = req.url.replace(/\/{2,}/g, '/');
   next();
@@ -21,15 +20,14 @@ app.get('/erank/healthz', (_req, res) => res.json({ ok: true }));
 
 // ENV
 const ZR   = (process.env.ZENROWS_API_KEY || '').trim();
-const ER   = (process.env.ERANK_COOKIES    || '').trim(); // "name=val; name2=val2"
-const PATH = (process.env.ERANK_TREND_PATH || 'trends').trim(); // 'trends' | 'trend-buzz'
+const ER   = (process.env.ERANK_COOKIES    || '').trim();   // "name=val; name2=val2"
+const PATH = (process.env.ERANK_TREND_PATH || 'trends').trim(); // solo fallback
 const TREND_URL = `https://members.erank.com/${PATH}`;
 const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36';
 
-// HTTP client
 const http = axios.create({ timeout: 120000 });
 
-// ---------- Helpers eRank AUTH (sin JS)
+/* -------------------- HTML direct (sin render) -------------------- */
 async function fetchErankPage() {
   const { data: html } = await http.get(TREND_URL, {
     headers: { 'User-Agent': UA, ...(ER ? { Cookie: ER } : {}) }
@@ -40,17 +38,31 @@ async function fetchErankPage() {
 
 function extractAuthFromHtml(html) {
   const $ = cheerio.load(html);
+
+  // CSRF
   const csrf = $('meta[name="csrf-token"]').attr('content') || '';
 
-  // window.APP_CONTEXT = {...}
+  // DAL token
   let dal = '';
-  const m = html.match(/window\.APP_CONTEXT\s*=\s*(\{[\s\S]*?\});/);
-  if (m) {
-    try { dal = JSON.parse(m[1]).DAL_TOKEN || ''; } catch (_) {}
-  }
+  const ctx = html.match(/window\.APP_CONTEXT\s*=\s*(\{[\s\S]*?\});/);
+  if (ctx) { try { dal = JSON.parse(ctx[1]).DAL_TOKEN || ''; } catch {} }
 
-  // Ziggy rutas => api/<PATH>
-  const apiPath = `api/${PATH}`;
+  // Ziggy -> detectar ruta API correcta
+  let apiPath = '';
+  const zig = html.match(/const\s+Ziggy\s*=\s*(\{[\s\S]*?\});/);
+  if (zig) {
+    try {
+      const z = JSON.parse(zig[1]);
+      const routes = z?.routes || {};
+      // Busca alguna ruta api.* que contenga "trend"
+      const key = Object.keys(routes).find(k =>
+        /^api\./.test(k) && /trend/i.test(k)
+      );
+      if (key && routes[key]?.uri) apiPath = routes[key].uri; // p.ej. "api/trend-buzz"
+    } catch {}
+  }
+  if (!apiPath) apiPath = `api/${PATH}`; // fallback
+
   return { csrf, dal, apiPath };
 }
 
@@ -64,7 +76,6 @@ async function callErankApi(apiPath, { q }) {
       ...(ER ? { Cookie: ER } : {}),
       'Accept': 'application/json, text/plain, */*',
       'X-Requested-With': 'XMLHttpRequest',
-      // estos dos si existen mejoran tasa de éxito
       ...(this?.csrf ? { 'X-CSRF-TOKEN': this.csrf } : {}),
       ...(this?.dal  ? { 'Authorization': `Bearer ${this.dal}` } : {}),
       'Referer': TREND_URL
@@ -73,7 +84,7 @@ async function callErankApi(apiPath, { q }) {
   return data;
 }
 
-// ---------- ZenRows HTML (solo para debug/otros endpoints)
+/* -------------------- ZenRows (debug/fallback) -------------------- */
 async function fetchRenderedHtml(url, { waitMs = 8000, block = 'image,font,stylesheet' } = {}) {
   const params = {
     apikey: ZR,
@@ -95,7 +106,32 @@ async function fetchRenderedHtml(url, { waitMs = 8000, block = 'image,font,style
   return html;
 }
 
-// ---------- INSPECT para ver scripts rápidos
+/* -------------------- Utilidades parseo -------------------- */
+function gatherStrings(node, acc) {
+  if (!node) return;
+  if (typeof node === 'string') { const s = node.trim(); if (s) acc.add(s); return; }
+  if (Array.isArray(node)) { node.forEach(n => gatherStrings(n, acc)); return; }
+  if (typeof node === 'object') {
+    for (const k of Object.keys(node)) {
+      const v = node[k];
+      if (typeof v === 'string' && /title|name|keyword|term/i.test(k)) {
+        const s = v.trim(); if (s) acc.add(s);
+      } else { gatherStrings(v, acc); }
+    }
+  }
+}
+
+/* -------------------- Endpoints -------------------- */
+app.get('/erank/debug', async (req, res) => {
+  try {
+    const target = String(req.query.url || TREND_URL);
+    const html = await fetchRenderedHtml(target, { waitMs: 8000 });
+    res.json({ url: target, ok: /<html/i.test(html), snippet: html.slice(0, 600) });
+  } catch (e) {
+    res.status(502).json({ error: e.response?.data || String(e) });
+  }
+});
+
 app.get('/erank/inspect', async (_req, res) => {
   try {
     const html = await fetchRenderedHtml(TREND_URL, { waitMs: 8000 });
@@ -111,19 +147,7 @@ app.get('/erank/inspect', async (_req, res) => {
   }
 });
 
-// ---------- DEBUG HTML
-app.get('/erank/debug', async (req, res) => {
-  try {
-    const target = String(req.query.url || TREND_URL);
-    const html = await fetchRenderedHtml(target, { waitMs: 8000 });
-    const ok = /<html/i.test(html);
-    res.json({ url: target, ok, snippet: html.slice(0, 600) });
-  } catch (e) {
-    res.status(502).json({ error: e.response?.data || String(e) });
-  }
-});
-
-// ---------- KEYWORDS via API JSON directo
+// Keywords: usa API autodetectada
 app.get('/erank/keywords', async (req, res) => {
   try {
     const q = String(req.query.q || '').toLowerCase();
@@ -131,82 +155,53 @@ app.get('/erank/keywords', async (req, res) => {
     const html = await fetchErankPage();
     const { csrf, dal, apiPath } = extractAuthFromHtml(html);
 
-    // guarda tokens en "this" de la función para headers opcionales
     const api = callErankApi.bind({ csrf, dal });
-    const apiJson = await api(apiPath, { q });
+    const data = await api(apiPath, { q });
 
-    // eRank puede devolver varias formas; normaliza a strings
     const acc = new Set();
-    const scan = (node) => {
-      if (!node) return;
-      if (typeof node === 'string') { const s = node.trim(); if (s) acc.add(s); return; }
-      if (Array.isArray(node)) { node.forEach(scan); return; }
-      if (typeof node === 'object') {
-        for (const k of Object.keys(node)) {
-          const v = node[k];
-          if (typeof v === 'string' && /title|name|keyword|term/i.test(k)) {
-            const s = v.trim(); if (s) acc.add(s);
-          } else { scan(v); }
-        }
-      }
-    };
-    scan(apiJson);
-
+    gatherStrings(data, acc);
     let results = Array.from(acc);
     if (q) results = results.filter(s => s.toLowerCase().includes(q));
+
     res.json({ source: `https://members.erank.com/${apiPath}`, query: q, count: results.length, results: results.slice(0, 100) });
   } catch (e) {
-    console.error('keywords scrape error:', e.response?.data || e.message || e);
+    console.error('keywords error:', e.response?.data || e.message || e);
     res.status(502).json({ error: e.response?.data || String(e) });
   }
 });
 
-// ---------- RESEARCH (títulos + links) vía API si existe, si no ZenRows
+// Research: títulos + links desde API si están presentes
 app.get('/erank/research', async (req, res) => {
   try {
     const q = String(req.query.q || '').toLowerCase();
 
     const html = await fetchErankPage();
     const { csrf, dal, apiPath } = extractAuthFromHtml(html);
-
     const api = callErankApi.bind({ csrf, dal });
-    let items = [];
 
-    try {
-      const data = await api(apiPath, { q });
-      const out = [];
-      const walk = (node) => {
-        if (!node) return;
-        if (Array.isArray(node)) { node.forEach(walk); return; }
-        if (typeof node === 'object') {
-          const title = (node.title || node.name || node.keyword || '').toString().trim();
-          const link  = (node.url || node.link || '').toString().trim();
-          if (title) out.push({ title, link });
-          for (const k of Object.keys(node)) walk(node[k]);
-        }
-      };
-      walk(data);
-      items = out.filter(it => !q || it.title.toLowerCase().includes(q));
-    } catch (_) {
-      // Fallback DOM si el API no devuelve estructura conocida
-      const dom = await fetchRenderedHtml(TREND_URL, { waitMs: 8000 });
-      const $ = cheerio.load(dom);
-      $('.trend-card, [data-testid="trend-card"]').each((_, el) => {
-        const $el = $(el);
-        const title = ($el.find('.title, [data-testid="trend-title"], h2, h3').first().text() || '').trim();
-        const link  = ($el.find('a').attr('href') || '').trim();
+    const data = await api(apiPath, { q });
+
+    const items = [];
+    const walk = (node) => {
+      if (!node) return;
+      if (Array.isArray(node)) { node.forEach(walk); return; }
+      if (typeof node === 'object') {
+        const title = (node.title || node.name || node.keyword || '').toString().trim();
+        const link  = (node.url || node.link || '').toString().trim();
         if (title && (!q || title.toLowerCase().includes(q))) items.push({ title, link });
-      });
-    }
+        for (const k of Object.keys(node)) walk(node[k]);
+      }
+    };
+    walk(data);
 
     res.json({ source: `https://members.erank.com/${apiPath}`, query: q, count: items.length, items: items.slice(0, 50) });
   } catch (e) {
-    console.error('research scrape error:', e.response?.data || e.message || e);
+    console.error('research error:', e.response?.data || e.message || e);
     res.status(502).json({ error: e.response?.data || String(e) });
   }
 });
 
-// ---------- Etsy público con ZenRows
+/* -------------------- Etsy público (ZenRows) -------------------- */
 app.get('/erank/products', async (req, res) => {
   try {
     const q = String(req.query.q || '');
@@ -229,7 +224,6 @@ app.get('/erank/products', async (req, res) => {
   }
 });
 
-// ---------- Etsy shop público
 app.get('/erank/mylistings', async (req, res) => {
   try {
     const shop = String(req.query.shop || '');
@@ -253,11 +247,10 @@ app.get('/erank/mylistings', async (req, res) => {
   }
 });
 
+/* -------------------- Listen -------------------- */
 app.listen(port, '0.0.0.0', () => {
   const routes = [];
-  app._router?.stack.forEach(mw => {
-    if (mw.route) routes.push(Object.keys(mw.route.methods).join(',').toUpperCase() + ' ' + mw.route.path);
-  });
+  app._router?.stack.forEach(mw => { if (mw.route) routes.push(Object.keys(mw.route.methods).join(',').toUpperCase() + ' ' + mw.route.path); });
   console.log('ROUTES:', routes);
   console.log('listening on', port);
 });
