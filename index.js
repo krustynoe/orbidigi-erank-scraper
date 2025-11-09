@@ -1,25 +1,16 @@
-// ===== index.js (CommonJS) — orden correcto =====
+// index.js (CommonJS) — eRank via ZenRows (HTML) + Cheerio
 
-// Polyfill antes de axios (undici en Node 18)
+// Polyfill antes de axios (evita "File is not defined" de undici, Node 18)
 globalThis.File = globalThis.File || class File {};
-
-// Bootstrap de diagnóstico (no usa 'app')
-process.on('uncaughtException', e => { console.error('uncaughtException:', e); process.exit(1); });
-process.on('unhandledRejection', e => { console.error('unhandledRejection:', e); process.exit(1); });
-console.log('Booting eRank scraper...');
-console.log('Node version:', process.version);
-console.log('PORT=', process.env.PORT);
-console.log('ZENROWS_API_KEY set =', !!process.env.ZENROWS_API_KEY);
-console.log('ERANK_COOKIES set =', !!(process.env.ERANK_COOKIES || process.env.ERANK_COOKIE));
 
 const express = require('express');
 const axios   = require('axios');
 const cheerio = require('cheerio');
 
-const app  = express();                               // <-- define 'app' AQUÍ
+const app  = express();
 const port = process.env.PORT || 3000;
 
-// Normaliza // -> /
+// Normaliza dobles barras // -> /
 app.use((req, _res, next) => {
   if (req.url.includes('//')) req.url = req.url.replace(/\/{2,}/g, '/');
   next();
@@ -28,19 +19,42 @@ app.use((req, _res, next) => {
 // Healthcheck
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
-// ---- Config ----
+// ---- ENV ----
 const ZR = process.env.ZENROWS_API_KEY || '';
 const ER = (process.env.ERANK_COOKIES || process.env.ERANK_COOKIE || '').trim();
+const TREND_ENV = (process.env.ERANK_TREND_URL || '').trim();
 
+// ---- Helpers ----
 function headersWithCookie(cookie) {
   return { 'User-Agent': 'Mozilla/5.0', ...(cookie ? { Cookie: cookie } : {}) };
 }
 
-// ZenRows -> HTML (sin css_extractor)
-async function zenGet(params, headers, timeout = 120000) {
-  const { data } = await axios.get('https://api.zenrows.com/v1/', { params, headers, timeout });
-  return data;
+// GET robusto con reintentos/backoff (para “socket hang up”/5xx)
+async function zenGet(params, headers, { retries = 2, baseDelay = 1500 } = {}) {
+  let lastErr;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const { data } = await axios.get('https://api.zenrows.com/v1/', {
+        params,
+        headers,
+        timeout: 120000
+      });
+      return data;
+    } catch (e) {
+      lastErr = e;
+      const msg = String(e?.code || e?.message || '');
+      const status = e?.response?.status || 0;
+      if (i < retries && (/ECONNRESET|socket hang up|ETIMEDOUT/i.test(msg) || status >= 500)) {
+        await new Promise(r => setTimeout(r, baseDelay * (i + 1)));
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr;
 }
+
+// ZenRows -> HTML (sin css_extractor). Lista válida para block_resources.
 async function fetchHtml(url, cookie = '', waitFor = 'body') {
   const params = {
     apikey: ZR,
@@ -48,7 +62,7 @@ async function fetchHtml(url, cookie = '', waitFor = 'body') {
     js_render: 'true',
     custom_headers: 'true',
     premium_proxy: 'true',
-    block_resources: 'true',
+    block_resources: 'images,media,fonts,tracking',
     wait_for: waitFor
   };
   const data = await zenGet(params, headersWithCookie(cookie));
@@ -57,20 +71,23 @@ async function fetchHtml(url, cookie = '', waitFor = 'body') {
   throw new Error(JSON.stringify(data));
 }
 
+// Detecta 404/login en el HTML de destino
 function looksLike404OrLogin(html) {
   const s = String(html || '').toLowerCase();
   return s.includes('page you were looking for was not found')
+      || s.includes('sorry, the page you were looking for was not found')
       || s.includes('sign in') || s.includes('login');
 }
 
-const TREND_CANDIDATES = [
-  process.env.ERANK_TREND_URL || '',                 // si la defines en Render, se intentará primero
+// Candidatas para Trend Buzz (si definiste ERANK_TREND_URL, va primero)
+const TREND_CANDIDATES = (TREND_ENV ? [TREND_ENV] : [
   'https://members.erank.com/trends',
   'https://members.erank.com/trend-buzz',
   'https://members.erank.com/keyword-trends',
   'https://members.erank.com/trendbuzz'
-].filter(Boolean);
+]);
 
+// Resuelve la primera URL que devuelva contenido real
 async function resolveTrendUrl(cookie) {
   for (const u of TREND_CANDIDATES) {
     try {
@@ -81,7 +98,7 @@ async function resolveTrendUrl(cookie) {
   return { url: null, html: null };
 }
 
-// ---- Debug ----
+// Debug: inspecciona una URL concreta
 app.get('/erank/debug', async (req, res) => {
   try {
     const u = String(req.query.url || TREND_CANDIDATES[0] || 'https://members.erank.com/trends');
@@ -92,12 +109,15 @@ app.get('/erank/debug', async (req, res) => {
   }
 });
 
-// ---- Rutas ----
+/* ---------------- RUTAS ERANK ---------------- */
+
+// /erank/keywords -> { source, query, count, results[] }
 app.get('/erank/keywords', async (req, res) => {
   try {
     const q = String(req.query.q || '');
     const { url, html } = await resolveTrendUrl(ER);
     if (!url) return res.status(502).json({ error: 'No trend page found (login/404)' });
+
     const $ = cheerio.load(html);
     const set = new Set();
     $('.trend-card .title, .trend, [data-testid="trend"], h1, h2, h3').each((_, el) => {
@@ -112,6 +132,7 @@ app.get('/erank/keywords', async (req, res) => {
   }
 });
 
+// /erank/products -> Etsy público { query, count, items[] }
 app.get('/erank/products', async (req, res) => {
   try {
     const q = String(req.query.q || '');
@@ -133,10 +154,12 @@ app.get('/erank/products', async (req, res) => {
   }
 });
 
+// /erank/mylistings -> Etsy shop { shop, count, items[] }
 app.get('/erank/mylistings', async (req, res) => {
   try {
     const shop = String(req.query.shop || '');
     if (!shop) return res.status(400).json({ error: "Missing 'shop' param" });
+
     const html = await fetchHtml(`https://www.etsy.com/shop/${encodeURIComponent(shop)}`, '', '.wt-grid__item-xs-6, .v2-listing-card');
     const $ = cheerio.load(html);
     const items = [];
@@ -155,11 +178,13 @@ app.get('/erank/mylistings', async (req, res) => {
   }
 });
 
+// /erank/research -> tarjetas { source, query, count, items[] }
 app.get('/erank/research', async (req, res) => {
   try {
     const q = String(req.query.q || '');
     const { url, html } = await resolveTrendUrl(ER);
     if (!url) return res.status(502).json({ error: 'No trend page found (login/404)' });
+
     const $ = cheerio.load(html);
     const items = [];
     $('.trend-card, .card, [data-testid="trend-card"]').each((_, el) => {
