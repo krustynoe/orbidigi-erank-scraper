@@ -1,3 +1,13 @@
+// --- bootstrap de diagnóstico ---
+process.on('uncaughtException', e => { console.error('uncaughtException:', e); process.exit(1); });
+process.on('unhandledRejection', e => { console.error('unhandledRejection:', e); process.exit(1); });
+
+console.log('Booting eRank scraper...');
+console.log('Node version:', process.version);
+console.log('PORT=', process.env.PORT);
+console.log('ZENROWS_API_KEY set =', !!process.env.ZENROWS_API_KEY);
+console.log('ERANK_COOKIES set =', !!(process.env.ERANK_COOKIES || process.env.ERANK_COOKIE));
+// --- fin bootstrap ---
 // ---------- CONFIG ----------
 const ZR = process.env.ZENROWS_API_KEY || '';
 const ER = (process.env.ERANK_COOKIES || '').trim();
@@ -72,3 +82,9 @@ async function resolveTrendUrl(cookie) {
   }
   return { url: null, html: null };
 }
+app.listen(process.env.PORT || 3000, '0.0.0.0', () => {
+  const routes = [];
+  app._router?.stack?.forEach(mw => { if (mw.route) routes.push(Object.keys(mw.route.methods).join(',').toUpperCase() + ' ' + mw.route.path); });
+  console.log('ROUTES:', routes);
+  console.log('listening on', process.env.PORT || 3000);
+});
