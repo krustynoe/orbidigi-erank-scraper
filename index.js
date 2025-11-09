@@ -1,4 +1,8 @@
 // index.js (CommonJS) — eRank con Cheerio sobre HTML de ZenRows
+
+// 1) Polyfill antes de axios (evita "File is not defined" de undici)
+globalThis.File = globalThis.File || class File {};
+
 const express = require('express');
 const axios   = require('axios');
 const cheerio = require('cheerio');
@@ -6,10 +10,7 @@ const cheerio = require('cheerio');
 const app  = express();
 const port = process.env.PORT || 3000;
 
-// Workaround undici (Node 18): evita "File is not defined"
-globalThis.File = globalThis.File || class File {};
-
-// Normaliza dobles barras en la URL: //erank -> /erank
+// Normaliza dobles barras (// -> /)
 app.use((req, _res, next) => {
   if (req.url.includes('//')) req.url = req.url.replace(/\/{2,}/g, '/');
   next();
@@ -25,7 +26,7 @@ function headersWithCookie(cookie) {
   return { 'User-Agent': 'Mozilla/5.0', ...(cookie ? { Cookie: cookie } : {}) };
 }
 
-// Trae HTML renderizado con ZenRows y lo devuelve como string
+// Trae HTML renderizado con ZenRows; sin css_extractor para evitar REQS004
 async function fetchHtml(url, cookie = '', waitFor = 'body') {
   const params = {
     apikey: ZR,
@@ -33,8 +34,8 @@ async function fetchHtml(url, cookie = '', waitFor = 'body') {
     js_render: 'true',
     custom_headers: 'true',
     wait_for: waitFor,
-    // premium_proxy: 'true',           // descomenta si el sitio protege fuerte
-    // block_resources: 'true',
+    // premium_proxy: 'true',  // descomenta si el sitio protege fuerte
+    // block_resources: 'true'
   };
   const { data } = await axios.get('https://api.zenrows.com/v1/', {
     params,
@@ -48,18 +49,18 @@ async function fetchHtml(url, cookie = '', waitFor = 'body') {
 
 /* ---------------- RUTAS ERANK ---------------- */
 
-// 1) Tendencias: /erank/keywords -> { query, count, results[] }
+// /erank/keywords -> { query, count, results[] }
 app.get('/erank/keywords', async (req, res) => {
   try {
     const q = String(req.query.q || '');
     const html = await fetchHtml('https://members.erank.com/trend-buzz', ER, 'body');
     const $ = cheerio.load(html);
-    const out = new Set();
+    const set = new Set();
     $('.trend-card .title, .trend, [data-testid="trend"], h1, h2, h3').each((_, el) => {
       const t = $(el).text().trim();
-      if (t) out.add(t);
+      if (t) set.add(t);
     });
-    const results = Array.from(out);
+    const results = Array.from(set);
     res.json({ query: q, count: results.length, results: results.slice(0, 20) });
   } catch (e) {
     console.error('keywords error:', e.response?.data || e.message || e);
@@ -67,7 +68,7 @@ app.get('/erank/keywords', async (req, res) => {
   }
 });
 
-// 2) Productos (ejemplo público en Etsy) -> { query, count, items[] }
+// /erank/products -> ejemplo público (Etsy) { query, count, items[] }
 app.get('/erank/products', async (req, res) => {
   try {
     const q = String(req.query.q || '');
@@ -93,7 +94,7 @@ app.get('/erank/products', async (req, res) => {
   }
 });
 
-// 3) Listados de una tienda (Etsy) -> { shop, count, items[] }
+// /erank/mylistings -> Etsy shop pública { shop, count, items[] }
 app.get('/erank/mylistings', async (req, res) => {
   try {
     const shop = String(req.query.shop || '');
@@ -121,7 +122,7 @@ app.get('/erank/mylistings', async (req, res) => {
   }
 });
 
-// 4) Research (tarjetas en trend-buzz) -> { query, count, items[] }
+// /erank/research -> tarjetas en trend-buzz { query, count, items[] }
 app.get('/erank/research', async (req, res) => {
   try {
     const q = String(req.query.q || '');
