@@ -1,4 +1,4 @@
-// index.js — eRank via ZenRows (rendered DOM) + Cheerio. CommonJS for Node 18 on Render.
+// index.js — eRank via JSON API + ZenRows fallback. CommonJS for Node 18 on Render.
 
 globalThis.File = globalThis.File || class File {};
 
@@ -26,9 +26,54 @@ const PATH = (process.env.ERANK_TREND_PATH || 'trends').trim(); // 'trends' | 't
 const TREND_URL = `https://members.erank.com/${PATH}`;
 const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36';
 
+// HTTP client
 const http = axios.create({ timeout: 120000 });
 
-// ZenRows helper (solo envía block_resources si existe)
+// ---------- Helpers eRank AUTH (sin JS)
+async function fetchErankPage() {
+  const { data: html } = await http.get(TREND_URL, {
+    headers: { 'User-Agent': UA, ...(ER ? { Cookie: ER } : {}) }
+  });
+  if (typeof html !== 'string') throw new Error('No HTML');
+  return html;
+}
+
+function extractAuthFromHtml(html) {
+  const $ = cheerio.load(html);
+  const csrf = $('meta[name="csrf-token"]').attr('content') || '';
+
+  // window.APP_CONTEXT = {...}
+  let dal = '';
+  const m = html.match(/window\.APP_CONTEXT\s*=\s*(\{[\s\S]*?\});/);
+  if (m) {
+    try { dal = JSON.parse(m[1]).DAL_TOKEN || ''; } catch (_) {}
+  }
+
+  // Ziggy rutas => api/<PATH>
+  const apiPath = `api/${PATH}`;
+  return { csrf, dal, apiPath };
+}
+
+async function callErankApi(apiPath, { q }) {
+  const url = `https://members.erank.com/${apiPath}`;
+  const params = q ? { q } : undefined;
+  const { data } = await http.get(url, {
+    params,
+    headers: {
+      'User-Agent': UA,
+      ...(ER ? { Cookie: ER } : {}),
+      'Accept': 'application/json, text/plain, */*',
+      'X-Requested-With': 'XMLHttpRequest',
+      // estos dos si existen mejoran tasa de éxito
+      ...(this?.csrf ? { 'X-CSRF-TOKEN': this.csrf } : {}),
+      ...(this?.dal  ? { 'Authorization': `Bearer ${this.dal}` } : {}),
+      'Referer': TREND_URL
+    }
+  });
+  return data;
+}
+
+// ---------- ZenRows HTML (solo para debug/otros endpoints)
 async function fetchRenderedHtml(url, { waitMs = 8000, block = 'image,font,stylesheet' } = {}) {
   const params = {
     apikey: ZR,
@@ -38,7 +83,7 @@ async function fetchRenderedHtml(url, { waitMs = 8000, block = 'image,font,style
     premium_proxy: 'true',
     wait: String(waitMs)
   };
-  if (block) params.block_resources = block; // evita '' inválido
+  if (block) params.block_resources = block;
 
   const { data } = await http.get('https://api.zenrows.com/v1/', {
     params,
@@ -50,184 +95,118 @@ async function fetchRenderedHtml(url, { waitMs = 8000, block = 'image,font,style
   return html;
 }
 
-// --- Helpers extracción
-function collectFromDom($) {
-  const out = new Set();
-  $('.trend-card .title, [data-testid="trend-title"], .trend-title, h2, h3').each((_, el) => {
-    const t = $(el).text().trim();
-    if (t) out.add(t);
-  });
-  $('[class*="keyword"], [class*="tag"], [data-testid="keyword"]').each((_, el) => {
-    const t = $(el).text().trim();
-    if (t) out.add(t);
-  });
-  return Array.from(out);
-}
-
-function jsonBlocksFromScripts($) {
-  const out = [];
-
-  // 1) <script type="application/json">...</script>
-  $('script[type="application/json"]').each((_, el) => {
-    const txt = ($(el).html() || '').trim();
-    if (txt) out.push(txt);
-  });
-
-  // 2) window.__X = {...} o arrays
-  $('script').each((_, el) => {
-    const txt = ($(el).html() || '').trim();
-    if (!txt) return;
-
-    const patterns = [
-      /__NEXT_DATA__\s*=\s*({[\s\S]*?});/g,
-      /__NUXT__\s*=\s*({[\s\S]*?});/g,
-      /__INITIAL_STATE__\s*=\s*({[\s\S]*?});/g,
-      /window\.[A-Za-z0-9_$.-]+\s*=\s*({[\s\S]*?});/g,
-      /window\.[A-Za-z0-9_$.-]+\s*=\s*(\[[\s\S]*?\]);/g
-    ];
-
-    for (const re of patterns) {
-      let m;
-      while ((m = re.exec(txt))) {
-        const balanced = balanceJson(m[1]);
-        if (balanced) out.push(balanced);
-      }
-    }
-  });
-
-  return out;
-}
-
-function balanceJson(raw) {
-  const s = (raw || '').trim();
-  const first = s[0];
-  const open = first === '{' ? '{' : first === '[' ? '[' : null;
-  const close = open === '{' ? '}' : open === '[' ? ']' : null;
-  if (!open) return null;
-  let depth = 0;
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    if (c === open) depth++;
-    else if (c === close) {
-      depth--;
-      if (depth === 0) return s.slice(0, i + 1);
-    }
+// ---------- INSPECT para ver scripts rápidos
+app.get('/erank/inspect', async (_req, res) => {
+  try {
+    const html = await fetchRenderedHtml(TREND_URL, { waitMs: 8000 });
+    const $ = cheerio.load(html);
+    const scripts = [];
+    $('script').each((i, el) => {
+      const txt = ($(el).html() || '').trim();
+      scripts.push({ i, len: txt.length, head: txt.slice(0, 160) });
+    });
+    res.json({ source: TREND_URL, scripts: scripts.slice(0, 20) });
+  } catch (e) {
+    res.status(502).json({ error: e.response?.data || String(e) });
   }
-  return null;
-}
+});
 
-function walkStrings(node, acc) {
-  if (typeof node === 'string') {
-    const v = node.trim();
-    if (v && v.length <= 100) acc.add(v);
-    return;
-  }
-  if (Array.isArray(node)) { node.forEach(n => walkStrings(n, acc)); return; }
-  if (node && typeof node === 'object') {
-    for (const k of Object.keys(node)) {
-      const v = node[k];
-      if (typeof v === 'string' && /title|name|keyword|term/i.test(k)) {
-        const s = v.trim(); if (s) acc.add(s);
-      } else {
-        walkStrings(v, acc);
-      }
-    }
-  }
-}
-
-// Debug
+// ---------- DEBUG HTML
 app.get('/erank/debug', async (req, res) => {
   try {
     const target = String(req.query.url || TREND_URL);
     const html = await fetchRenderedHtml(target, { waitMs: 8000 });
-    const ok = /trend|keyword|h2|h3/i.test(html);
+    const ok = /<html/i.test(html);
     res.json({ url: target, ok, snippet: html.slice(0, 600) });
   } catch (e) {
     res.status(502).json({ error: e.response?.data || String(e) });
   }
 });
 
-// /erank/keywords con retries + JSON fallback
+// ---------- KEYWORDS via API JSON directo
 app.get('/erank/keywords', async (req, res) => {
   try {
     const q = String(req.query.q || '').toLowerCase();
 
-    // 1) 8 s bloqueando imágenes, fuentes y CSS
-    let html = await fetchRenderedHtml(TREND_URL, { waitMs: 8000, block: 'image,font,stylesheet' });
-    let $ = cheerio.load(html);
-    let results = collectFromDom($);
+    const html = await fetchErankPage();
+    const { csrf, dal, apiPath } = extractAuthFromHtml(html);
 
-    // 2) 12 s con mismo bloqueo
-    if (results.length === 0) {
-      html = await fetchRenderedHtml(TREND_URL, { waitMs: 12000, block: 'image,font,stylesheet' });
-      $ = cheerio.load(html);
-      results = collectFromDom($);
-    }
+    // guarda tokens en "this" de la función para headers opcionales
+    const api = callErankApi.bind({ csrf, dal });
+    const apiJson = await api(apiPath, { q });
 
-    // 3) 15 s y SIN bloquear nada (no enviar block_resources)
-    if (results.length === 0) {
-      html = await fetchRenderedHtml(TREND_URL, { waitMs: 15000, block: null });
-      $ = cheerio.load(html);
-      results = collectFromDom($);
-    }
-
-    // 4) Fallback: JSON embebido
-    if (results.length === 0) {
-      const acc = new Set();
-      for (const raw of jsonBlocksFromScripts($)) {
-        try { walkStrings(JSON.parse(raw), acc); } catch (_) {}
+    // eRank puede devolver varias formas; normaliza a strings
+    const acc = new Set();
+    const scan = (node) => {
+      if (!node) return;
+      if (typeof node === 'string') { const s = node.trim(); if (s) acc.add(s); return; }
+      if (Array.isArray(node)) { node.forEach(scan); return; }
+      if (typeof node === 'object') {
+        for (const k of Object.keys(node)) {
+          const v = node[k];
+          if (typeof v === 'string' && /title|name|keyword|term/i.test(k)) {
+            const s = v.trim(); if (s) acc.add(s);
+          } else { scan(v); }
+        }
       }
-      results = Array.from(acc);
-    }
+    };
+    scan(apiJson);
 
+    let results = Array.from(acc);
     if (q) results = results.filter(s => s.toLowerCase().includes(q));
-    results = Array.from(new Set(results.map(s => s.trim()))).filter(Boolean);
-
-    res.json({ source: TREND_URL, query: q, count: results.length, results: results.slice(0, 100) });
+    res.json({ source: `https://members.erank.com/${apiPath}`, query: q, count: results.length, results: results.slice(0, 100) });
   } catch (e) {
     console.error('keywords scrape error:', e.response?.data || e.message || e);
     res.status(502).json({ error: e.response?.data || String(e) });
   }
 });
 
-// /erank/inspect
-app.get('/erank/inspect', async (_req, res) => {
-  try {
-    const html = await fetchRenderedHtml(TREND_URL, { waitMs: 15000, block: null });
-    const $ = cheerio.load(html);
-    const scripts = [];
-    $('script').each((i, el) => {
-      const txt = ($(el).html() || '').trim();
-      scripts.push({ i, len: txt.length, head: txt.slice(0, 120) });
-    });
-    const titles = collectFromDom($);
-    res.json({ source: TREND_URL, scripts: scripts.slice(0, 20), titles: titles.slice(0, 20) });
-  } catch (e) {
-    res.status(502).json({ error: e.response?.data || String(e) });
-  }
-});
-
-// /erank/research
+// ---------- RESEARCH (títulos + links) vía API si existe, si no ZenRows
 app.get('/erank/research', async (req, res) => {
   try {
     const q = String(req.query.q || '').toLowerCase();
-    const html = await fetchRenderedHtml(TREND_URL, { waitMs: 8000, block: 'image,font,stylesheet' });
-    const $ = cheerio.load(html);
-    const items = [];
-    $('.trend-card, [data-testid="trend-card"]').each((_, el) => {
-      const $el = $(el);
-      const title = ($el.find('.title, [data-testid="trend-title"], h2, h3').first().text() || '').trim();
-      const link  = ($el.find('a').attr('href') || '').trim();
-      if (title && (!q || title.toLowerCase().includes(q))) items.push({ title, link });
-    });
-    res.json({ source: TREND_URL, query: q, count: items.length, items: items.slice(0, 50) });
+
+    const html = await fetchErankPage();
+    const { csrf, dal, apiPath } = extractAuthFromHtml(html);
+
+    const api = callErankApi.bind({ csrf, dal });
+    let items = [];
+
+    try {
+      const data = await api(apiPath, { q });
+      const out = [];
+      const walk = (node) => {
+        if (!node) return;
+        if (Array.isArray(node)) { node.forEach(walk); return; }
+        if (typeof node === 'object') {
+          const title = (node.title || node.name || node.keyword || '').toString().trim();
+          const link  = (node.url || node.link || '').toString().trim();
+          if (title) out.push({ title, link });
+          for (const k of Object.keys(node)) walk(node[k]);
+        }
+      };
+      walk(data);
+      items = out.filter(it => !q || it.title.toLowerCase().includes(q));
+    } catch (_) {
+      // Fallback DOM si el API no devuelve estructura conocida
+      const dom = await fetchRenderedHtml(TREND_URL, { waitMs: 8000 });
+      const $ = cheerio.load(dom);
+      $('.trend-card, [data-testid="trend-card"]').each((_, el) => {
+        const $el = $(el);
+        const title = ($el.find('.title, [data-testid="trend-title"], h2, h3').first().text() || '').trim();
+        const link  = ($el.find('a').attr('href') || '').trim();
+        if (title && (!q || title.toLowerCase().includes(q))) items.push({ title, link });
+      });
+    }
+
+    res.json({ source: `https://members.erank.com/${apiPath}`, query: q, count: items.length, items: items.slice(0, 50) });
   } catch (e) {
     console.error('research scrape error:', e.response?.data || e.message || e);
     res.status(502).json({ error: e.response?.data || String(e) });
   }
 });
 
-// Etsy público
+// ---------- Etsy público con ZenRows
 app.get('/erank/products', async (req, res) => {
   try {
     const q = String(req.query.q || '');
@@ -250,7 +229,7 @@ app.get('/erank/products', async (req, res) => {
   }
 });
 
-// Etsy shop público
+// ---------- Etsy shop público
 app.get('/erank/mylistings', async (req, res) => {
   try {
     const shop = String(req.query.shop || '');
