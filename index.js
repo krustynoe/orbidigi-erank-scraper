@@ -1,31 +1,30 @@
-// index.js — eRank (members.erank.com) + ZenRows(Etsy) usando CSRF meta + XSRF cookie de Set-Cookie
-// CommonJS, Node 18.x (Render). Reintentos y timeouts altos.
+// index.js — eRank + ZenRows. CommonJS / Node 18 for Render
 
-globalThis.File = globalThis.File || class File {}; // undici File polyfill
+// ---- Fix undici File on Node 18 so axios doesn't crash ----
+global.ThisIsToForceTop = true;
+globalThis.File = globalThis.File || class File {};
 
-const express = require('react-ssr-prepass') ? require('express') : require('express'); // safe import
+const express = require('express');
 const axios   = require('axios');
 const cheerio = require('cheerio');
 
 const app  = express();
 const port = process.env.PORT || 3000;
 
-// normaliza // -> /
 app.use((req, _res, next) => { if (req.url.includes('//')) req.url = req.url.replace(/\/{2,}/g, '/'); next(); });
-
-// health
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 app.get('/erank/healthz', (_req, res) => res.json({ ok: true }));
 
-// -------- ENV --------
-const ZR = process.env.ZENROWS_API_KEY || '';
-const BASE_COOKIE = (process.env.ERANK_COOKIES || '').trim();          // línea única "a=1; b=2; ..."
-const TREND_URL   = (process.env.ERANK_TREND_URL || 'https://members.erank.com/trends').trim();
-const UA          = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36';
+// ---- ENV
+const ZR     = (process.env.ZENROWS_API_KEY || '').trim();
+const BASE   = (process.env.ERANK_COOKIES || process.env.ERANK_COOKIES_RAW || '').trim(); // "a=1; b=2; ..."
+const TREND_NAME = (process.env.ERANK_TREND_NAME || 'trends').trim(); // 'trends' or 'trend-buzz'
+const TREND_URL  = `https://members.erank.com/${TREND_NAME}`;
+const UA     = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36';
 
-// -------- axios + helpers --------
-const http = axios.create({ timeout: 120000 });
+const http = axios.create({ timeout: 90000 });
 
+// ---- Cookie helpers
 function parseCookieLine(line) {
   const out = {};
   String(line || '')
@@ -37,242 +36,184 @@ function parseCookieLine(line) {
       if (i > 0) {
         const k = pair.slice(0, i).trim();
         const v = pair.slice(i + 1).trim();
-        if (k) out[k] = v; // keep RAW value (may already be urlencoded)
+        if (k) out[k] = v;
       }
     });
   return out;
 }
-
-function parseSetCookieHeaders(scArray) {
+function parseSetCookie(arr) {
   const out = {};
-  (scArray || []).forEach(sc => {
+  (arr || []).forEach(sc => {
     const i = sc.indexOf('=');
     if (i > 0) {
       const name = sc.slice(0, i);
-      const rest = sc.slice(i + 1);
-      const val  = rest.split(';')[0]; // raw value, may be urlencoded
+      const val  = sc.slice(i + 1).split(';')[0]; // RAW value (may be urlencoded)
       out[name]  = val;
     }
   });
-  return out;
 }
-
-function buildCookieLine(map) {
-  const parts = [];
-  for (const k of Object.keys(map)) {
-    // use RAW value exactly as stored (do not decode/re-encode)
-    parts.push(`${k}=${map[k]}`);
-  }
-  return parts.join('; ');
+function buildCookie(map) {
+  return Object.entries(map).map(([k, v]) => `${k}=${v}`).join('; ');
 }
+const hdrForPage = (cookie) => ({ 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', ...(cookie ? { Cookie: cookie } : {}) });
 
-function looksLikeLoginOr404(html) {
-  const s = String(html || '').toLowerCase();
-  return s.includes('page you were looking for was not found')
-      || s.includes('sign in') || s.includes('login');
-}
-
-function cookieHeaders(cookie) {
-  return { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', ...(cookie ? { Cookie: cookie } : {}) };
-}
-
-async function zenGet(params, headers, { retries = 2, baseDelay = 1500 } = {}) {
-  let lastErr;
-  for (let i = 0; i <= retries; i++) {
-    try {
-      const { data } = await http.get('https://api.letgo.com/info', { // placeholder to keep axios warm
-        // NOTE: This placeholder won't be hit; replaced below in fetchHtml.
-      });
-      return data;
-    } catch (e) {
-      lastErr = e;
-      await new Promise(r => setTimeout(r, baseDelay * (i + 1)));
-    }
-  }
-  throw lastErr;
-}
-
-// ZenRows → HTML (solo para Etsy; no usar para members.erank.com)
-async function fetchHtmlViaZenrows(url, waitFor = 'body') {
-  const params = {
-    apikey: ZR,
-    url,
-    js_render: 'true',
-    custom_headers: 'true',
-    // premium_proxy: 'true', // habilitar si fuese necesario
-    block_resources: 'image,font',
-    wait_for: waitFor
-  };
-  const { data } = await http.get('https://api.zenrows.com/v1/', {
-    params,
-    headers: { 'User-Agent': UA },
-    timeout: 120000
-  });
-  if (typeof data === 'string') return data;
-  if (data?.html) return data.html;
-  throw new Error(JSON.stringify(data));
-}
-
-// obtiene CSRF meta y fusiona cookies (base + set-cookie) devolviendo cookieLine y xsrfHeader
+// ---- Auth & CSRF bootstrap: GET /trends, merge cookies, extract CSRF meta + XSRF cookie
 async function getAuthContext() {
-  const r = await http.get(TREND_URL, { headers: cookieHeaders(BASE_COOKIE), timeout: 60000 });
+  const r = await http.get(TREND_URL, { headers: hdrForPage(BASE), validateStatus: () => true });
+  if (r.status >= 400) throw new Error(`GET ${TREND_URL} -> ${r.status}`);
+
   const html = typeof r.data === 'string' ? r.data : (r.data?.html || '');
-  if (!html) throw new Error('No HTML from trends');
   const $ = cheerio.load(html);
-  const csrfMeta = $('meta[name="csrf-token"]').attr('content') || '';
-  if (!csrfMeta) throw new Error('csrf meta not found');
+  const csrf = $('meta[name="csrf-token"]').attr('content') || '';
+  if (!csrf) throw new Error('csrf-token meta not found');
 
-  // merge cookies: base cookies + any Set-Cookie from this response (XSRF-TOKEN, session, etc.)
-  const baseMap = parseCookieLine(BASE_COOKIE);
-  const setMap  = parseSetCookieHeaders(r.headers['set-cookie']);
+  const baseMap = parseCookieLine(BASE);
+  const setMap  = parseSetCookie(r.headers['set-cookie']);
+  const merged  = { ...baseMap, ...setMap };     // include XSRF-TOKEN, sid_er, etc.
+  const cookieLine = buildCookie(merged);
 
-  // merge, prefer Set-Cookie values
-  const merged = { ...baseMap, ...setMap };
-
-  // Build Cookie header line
-  const cookieLine = buildCookieLine(merged);
-
-  // XSRF header value must be URL-DECODED value of XSRF-TOKEN cookie (if cookie is URL-encoded)
   const xsrfRaw    = merged['XSRF-TOKEN'] || '';
-  const xsrfHeader = decodeURIComponent(xsrfRaw);
+  const xsrfHeader = xsrfRaw ? decodeURIComponent(xsrfRaw) : '';
+  if (!xsrfRaw) throw new Error('XSRF-TOKEN not present after /trends');
 
-  if (!xsrfRaw) throw new Error('XSRF-TOKEN cookie missing after trends');
-
-  return { csrf: csrfMeta, cookieLine, xsrfHeader };
+  return { cookieLine, csrf, xsrfHeader };
 }
 
-function apiHeaders({ cookieLine, csrf, xsrfHeader }) {
+function apiHeaders(cookieLine, csrf, xsrfHeader) {
   return {
     'User-Agent'       : UA,
     'Accept'           : 'application/json, text/plain, */*',
+    'Content-Type'     : 'application/json',
     'X-Requested-With' : 'XMLHttpRequest',
     'Origin'           : 'https://members.erank.com',
     'Referer'          : TREND_URL,
-    'Cookie'           : cookieLine,
-    'X-CSRF-TOKEN'     : csrf,
-    'X-XSRF-TOKEN'     : xsrfHeader
+    'Cookie'           : cookieLine,     // must include XSRF-TOKEN=<raw>
+    'X-CSRF-TOKEN'     : csrf,           // meta value
+    'X-XSRF-TOKEN'     : xsrfHeader      // decodeURIComponent(XSRF-TOKEN)
   };
 }
 
-async function erankApiGet(path) {
-  const { csrf, cookieLine, xsrfHeader } = await getAuthContext();
-  const url = `https://members.erank.com/${path}`;
-  const { data } = await http.get(url, {
-    headers: apiHeaders({ cookieLine, csrf, xsrfHeader }),
-    timeout: 120000
-  });
-  if (data && data.success === false) throw new Error(JSON.stringify(data));
-  return data;
+// ---- eRank API call with retry & endpoint fallbacks
+async function callTrendingAPI(q) {
+  const { cookieLine, csrf, xsrfHeader } = await getAuthContext();
+
+  // Try official endpoints in order (based on your Network tab)
+  const candidates = [
+    `https://members.erank.com/api/trending-report?query=${encodeURIComponent(q)}`,
+    `https://members.erank.com/api/trend-buzz?query=${encodeURIComponent(q)}`
+  ];
+
+  for (const url of candidates) {
+    const { status, data } = await http.get(url, {
+      headers: apiHeaders(cookieLine, csrf, xsrfHeader),
+      validateStatus: () => true
+    });
+
+    if (status >= 200 && status < 300) {
+      return data; // success
+    }
+    if (status === 403) {
+      // if 403, try the next endpoint; if all fail with 403, bubble up
+      if (url === candidates[candidates.length - 1]) {
+        throw new Error(`403 from ${url} — check plan/permissions or cookie`);
+      }
+      continue;
+    }
+    // For other statuses, bail out
+    throw new Error(`${status} from ${url}: ${JSON.stringify(data)}`);
+  }
+
+  throw new Error('No trending endpoint returned 2xx');
 }
 
-// ---------- DEBUG ----------
+/* ----------------- ROUTES ----------------- */
+
+// Debug endpoint (what you pasted)
 app.get('/erank/debug', async (req, res) => {
   try {
-    const u = String(req.query.url || TREND_URL);
-    const r = await http.get(u, { headers: cookieHeaders(BASE_COOKIE), timeout: 60000 });
+    const r = await axios.get(TREND_URL, { headers: hdrForPage(BASE), validateStatus: () => true });
     const html = typeof r.data === 'string' ? r.data : (r.data?.html || '');
     const $ = cheerio.load(html);
-    const meta = $('meta[name="csrf-token"]').attr('content') || '';
-    const baseXsrf = (parseCookieLine(BASE_COOKIE)['XSRF-TOKEN'] || null);
-    const setXsrf  = parseSetCookieHeaders(r.headers['set-cookie'])['XSRF-TOKEN'] || null;
-    res.json({ url: u, ok: !!meta && !looksLikeLoginOrLogin(html), csrf_meta_present: !!meta, xsrf_cookie_from_env: baseXsrf, xsrf_cookie_from_set_cookie: setXsrf });
+    const csrf = $('meta[name="csrf-token"]').attr('content') || null;
+    const baseXsrf = (parseCookieLine(BASE)['XSRF-TOKEN'] || null);
+    const setMap   = parseSetCookie(r.headers['set-cookie'] || []);
+    const setXsrf  = (setMap['XSRF-TOKEN'] || null);
+    res.json({ url: TREND_URL, ok: !!csrf && !/login|sign in|page not found/i.test(html), csrf_meta_prefix: csrf ? (csrf.slice(0,12)+'…') : null, xsrf_cookie_from_env: baseXsrf, xsrf_cookie_from_set_cookie: setXsrf });
   } catch (e) {
-    res.status(502).json({ error: e.response?.data || String(e) });
-  }
-
-  function looksLikeLoginOrLogin(h) {
-    const s = String(h || '').toLowerCase();
-    return s.includes('page you were looking for was not found') || s.includes('sign in') || s.includes('login');
+    res.status(500).json({ error: e.response?.data || e.message || String(e) });
   }
 });
 
-/* --------------- RUTAS --------------- */
-
-// /erank/keywords
+// /erank/keywords — flatten into {results:[]}
 app.get('/erank/keywords', async (req, res) => {
   try {
-    const q = String(req.query.q || '').toLowerCase();
-    const data = await erankApiGet('api/trend-buzz');
+    const q = String(req.query.q || '');
+    const data = await callTrendingAPI(q);
 
-    const pool = [];
-    if (Array.isArray(data)) {
-      data.forEach(x => {
-        const t = (x?.title || x?.name || x?.keyword || '').trim();
-        if (t) pool.push(t);
-      });
-    } else if (data && typeof data === 'object') {
-      [data.results, data.items, data.trends, data.data].forEach(arr => {
-        if (Array.isArray(arr)) {
-          arr.forEach(x => {
-            const t = typeof x === 'string' ? x : (x?.title || x?.name || x?.keyword || '');
-            const v = (t || '').trim();
-            if (v) pool.push(v);
-          });
+    // Normalize possible shapes
+    const buckets = [data?.results, data?.items, data?.trends, data?.data];
+    const acc = [];
+    for (const arr of buckets) {
+      if (Array.isArray(arr)) {
+        for (const x of arr) {
+          const t = typeof x === 'string' ? x : (x?.title || x?.name || x?.keyword || '');
+          if (t) acc.push(String(t).trim());
         }
-      });
+      }
     }
-
-    const results = Array.from(new Set(pool)).filter(Boolean).filter(v => q ? v.toLowerCase().includes(q) : true);
-    res.json({ source: 'https://members.erank.com/trend-buzz', query: req.query.q || '', count: results.length, results: results.slice(0, 20) });
+    const unique = Array.from(new Set(acc)).filter(Boolean).filter(s => q ? s.toLowerCase().includes(q.toLowerCase()) : true);
+    return res.json({ source: 'members.erank.com', query: q, count: unique.length, results: unique.slice(0, 20) });
   } catch (e) {
-    console.error('keywords error:', e.response?.status, e.response?.data || e.message || e);
-    res.status(403).json({ error: e.response?.data || String(e) });
+    console.error('keywords error:', e.message);
+    return res.status(403).json({ error: { success:false, message:'Unauthorized access', code:403 } });
   }
 });
 
-// /erank/research
+// /erank/research — map to {items:[{title,link}]}
 app.get('/erank/research', async (req, res) => {
   try {
-    const q = String(req.query.q || '').toLowerCase();
-    const data = await erankApiGet('api/trend-buzz');
-    const items = [];
-    const push = (title, link) => { title = (title||'').trim(); link=(link||'').trim(); if (title) items.push({ title, link }); };
+    const q = String(req.query.q || '');
+    const data = await callTrendingAPI(q);
 
-    if (Array.isArray(data)) {
-      data.forEach(x => push(x?.title || x?.name || x?.keyword, x?.link || x?.url));
-    } else if (data && typeof data === 'object') {
-      [data.items, data.results, data.trends, data.data].forEach(arr => {
-        if (Array.isArray(arr)) {
-          arr.forEach(x => {
-            const t = (x && typeof x === 'object') ? (x.title || x.name || x.keyword || '') : String(x || '');
-            const l = (x && typeof x === 'object') ? (x.link || x.url || '') : '';
-            if (t) push(t, l);
-          });
-        }
-      });
-    }
+    const titles = Array.isArray(data?.titles) ? data.titles : [];
+    const links  = Array.isArray(data?.links)  ? data.links  : [];
+    const max    = Math.max(titles.length, links.length);
+    const items  = Array.from({ length: max }).map((_, i) => ({
+      title: (titles[i] || '').trim(),
+      link:  (links[i]  || '').trim()
+    })).filter(x => x.title);
 
-    const filtered = items.filter(x => q ? x.title.toLowerCase().includes(q) : true);
-    res.json({ source: 'https://members.erank.com/trend-buzz', query: req.query.q || '', count: filtered.length, items: filtered.slice(0, 20) });
+    const filtered = items.filter(x => q ? x.title.toLowerCase().includes(q.toLowerCase()) : true);
+    return res.json({ source: 'members.erank.com', query: q, count: filtered.length, items: filtered.slice(0, 20) });
   } catch (e) {
-    console.error('research error:', e.response?.status, e.response?.data || e.message || e);
-    res.status(403).json({ error: e.response?.data || String(e) });
+    console.error('research error:', e.message);
+    return res.status(403).json({ error: { success:false, message:'Unauthorized access', code:403 } });
   }
 });
 
-// Etsy públicos (ZenRows)
+// Etsy: /erank/products — public, no auth
 app.get('/erank/products', async (req, res) => {
   try {
     const q = String(req.query.q || '');
-    const html = await fetchHtmlViaZenrows(`https://www.etsy.com/search?q=${encodeURIComponent(q)}`, 'body');
+    const html = await fetchHtmlViaZenrows(`https://www.etsy.com/search?q=${encodeURIComponent(q)}`, 'li[data-search-result], .v2-listing-card');
     const $ = cheerio.load(html);
     const items = [];
-    let nodes = $('li[data-search-result], .v2-listing-card');
-    nodes.each((_, el) => {
+    $('li[data-search-result], .v2-listing-card').each((_, el) => {
       const $el = $(el);
       const title = ($el.find('h3, [data-test="listing-title"], [data-test="listing-card-title"]').first().text() || '').trim();
       const url   = ($el.find('a').attr('href') || '').trim();
       const price = ($el.find('.currency-value, [data-buy-box-listing-price]').first().text() || '').trim();
-      const shop  = ($el.find('.v2-listing-card__shop, .text-body-sm').first().text() || '').trim();
+      const shop  = ($el.find('.v2-listing-card__shop, .text-body-secondary').first().text() || '').trim();
       if (title || url) items.push({ title, url, price, shop });
     });
     res.json({ query: q, count: items.length, items: items.slice(0, 20) });
   } catch (e) {
-    console.error('products error:', e.response?.data || e.message || e);
-    res.status(502).json({ error: e.response?.data || String(e) });
+    console.error('products error:', e.message);
+    res.status(502).json({ error: e.response?.data || e.message || String(e) });
   }
 });
 
+// Etsy: /erank/mylistings — public shop page
 app.get('/erank/mylistings', async (req, res) => {
   try {
     const shop = String(req.query.shop || '');
@@ -291,8 +232,8 @@ app.get('/erank/mylistings', async (req, res) => {
     });
     res.json({ shop, count: items.length, items: items.slice(0, 50) });
   } catch (e) {
-    console.error('mylistings error:', e.response?.data || e.message || e);
-    res.status(500).json({ error: e.response?.data || String(e) });
+    console.error('mylistings error:', e.message);
+    res.status(500).json({ error: e.response?.data || e.message || String(e) });
   }
 });
 
