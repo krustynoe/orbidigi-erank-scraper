@@ -1,5 +1,5 @@
 // index.js — eRank API autodetect + CSRF/XSRF/JWT
-// Fallback del API vía ZenRows con JS render, reintentos y logging.
+// Fallback del API vía ZenRows con JS render, reintentos, geo y logging.
 // Node 18, CommonJS, para Render.
 
 globalThis.File = globalThis.File || class File {};
@@ -20,8 +20,8 @@ app.get('/erank/healthz', (_req, res) => res.json({ ok: true }));
 
 // ENV
 const ZR   = (process.env.ZENROWS_API_KEY || '').trim();
-const ER   = (process.env.ERANK_COOKIES   || '').trim();  // cookies en una línea
-const PATH = (process.env.ERANK_TREND_PATH || 'trend-buzz').trim(); // fallback
+const ER   = (process.env.ERANK_COOKIES   || '').trim();  // cookies en una sola línea
+const PATH = (process.env.ERANK_TREND_PATH || 'trend-buzz').trim(); // fallback coherente
 const TREND_URL = `https://members.erank.com/${PATH}`;
 const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36';
 
@@ -103,44 +103,55 @@ async function callErankApi(apiPath, { q }) {
     console.warn('direct API call failed with status:', sc || 'unknown');
   }
 
-  // 2) fallback por ZenRows con JS render, sin bloquear recursos, reintentos
+  // 2) fallback por ZenRows con JS render, sin bloquear recursos, reintentos + diagnóstico
   const waits = [8000, 12000, 15000];
+  const countries = ['us', 'gb', 'de']; // rota regiones si persiste el WAF
   let lastErr;
+
   for (const w of waits) {
-    try {
-      const zrParams = {
-        apikey: ZR,
-        url: fullUrl,
-        custom_headers: 'true',
-        premium_proxy: 'true',
-        js_render: 'true',
-        wait: String(w)
-      };
-      const r = await http.get('https://api.zenrows.com/v1/', {
-        params: zrParams,
-        headers,
-        timeout: 120000,
-        validateStatus: () => true
-      });
+    for (const country of countries) {
+      try {
+        const zrParams = {
+          apikey: ZR,
+          url: fullUrl,
+          custom_headers: 'true',
+          premium_proxy: 'true',
+          js_render: 'true',
+          wait: String(w),
+          // diagnóstico
+          original_status: 'true',
+          proxy_country: country,
+          allowed_status_codes: '400,401,403,404,422,429'
+        };
 
-      const zStatus = r?.status || r?.data?.statusCode || r?.data?.status || 'unknown';
-      console.log(`ZenRows fallback attempt wait=${w}ms → status=${zStatus}`);
+        const r = await http.get('https://api.zenrows.com/v1/', {
+          params: zrParams,
+          headers,
+          timeout: 120000,
+          validateStatus: () => true
+        });
 
-      // ZenRows puede devolver JSON de error {code,...}. Detecta y reintenta.
-      if (r?.data && typeof r.data === 'object' && (r.data.code || r.data.error)) {
-        lastErr = new Error(`ZenRows error: ${r.data.title || r.data.code || zStatus}`);
-        continue;
+        const zStatus = r?.status || r?.data?.statusCode || r?.data?.status || 'unknown';
+        console.log(`ZenRows fallback attempt wait=${w}ms country=${country} → status=${zStatus}`);
+
+        // ZenRows puede devolver JSON de error {code,...}. Detecta y reintenta.
+        if (r?.data && typeof r.data === 'object' && (r.data.code || r.data.error)) {
+          const code = r.data.code || r.data.error?.code || 'unknown';
+          const title = r.data.title || r.data.error?.title || '';
+          lastErr = new Error(`ZenRows error: ${code} ${title}`);
+          if (['REQS004','RESP001'].includes(code) || [400,403,422,429].includes(Number(zStatus))) continue;
+        }
+
+        if (typeof r.data === 'object' && !('html' in r.data)) return r.data;
+        if (typeof r.data === 'string') {
+          try { return JSON.parse(r.data); } catch {}
+        }
+
+        lastErr = new Error(`ZenRows returned non-JSON (status=${zStatus})`);
+      } catch (e) {
+        lastErr = e;
+        console.warn(`ZenRows attempt wait=${w}ms country=${country} failed:`, e?.response?.status || e.message);
       }
-
-      if (typeof r.data === 'object' && !('html' in r.data)) return r.data;
-      if (typeof r.data === 'string') {
-        try { return JSON.parse(r.data); } catch {}
-      }
-
-      lastErr = new Error(`ZenRows returned non-JSON (status=${zStatus})`);
-    } catch (e) {
-      lastErr = e;
-      console.warn(`ZenRows attempt with wait=${w}ms failed:`, e?.response?.status || e.message);
     }
   }
   throw lastErr || new Error('ZenRows fallback failed');
