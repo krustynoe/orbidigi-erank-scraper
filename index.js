@@ -14,12 +14,13 @@ const port = process.env.PORT || 3000;
 const ZR    = (process.env.ZENROWS_API_KEY || '').trim();
 const EMAIL = (process.env.ERANK_EMAIL || '').trim();
 const PASS  = (process.env.ERANK_PASSWORD || '').trim();
-const PATH  = (process.env.ERANK_TREND_PATH || 'trend-buzz').trim(); // 'trend-buzz' o 'trends'
+const PATH  = (process.env.ERANK_TREND_PATH || 'trend-buzz').trim();
 const UA    = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36';
 
-const http = axios.create({ timeout: 120000, validateStatus: () => true });
+// ↑ sube a 240 s para cubrir login + render + espera
+const http = axios.create({ timeout: 240000, validateStatus: () => true });
 
-// ===== Cookie jar simple =====
+// ===== Cookie jar (memoria) =====
 const jar = new Map(); // name -> value
 function applySetCookies(res) {
   const sc = res.headers?.['set-cookie'];
@@ -53,8 +54,9 @@ async function zenrowsGet(url, params={}, headers={}) {
     custom_headers: 'true',
     premium_proxy: 'true',
     js_render: 'true',
-    wait: String(params.wait || 20000),                     // esperar más para hidratar
-    wait_for: params.wait_for || 'table,tbody tr,div[role="table"]',
+    wait: String(params.wait || 20000),
+    // selector amplio para vistas con tabla o app montada
+    wait_for: params.wait_for || '.table,table,tbody tr,[data-page],[id="app"],div[role="table"]',
     proxy_country: params.country || 'us',
     original_status: 'true'
   };
@@ -109,18 +111,18 @@ async function loginIfNeeded(force=false) {
   sessionReadyAt = Date.now();
 }
 
-// ===== Utilidades de parsing JSON embebido y DOM =====
+// ===== Parsing helpers =====
 function balanceJson(s) {
   if (!s) return null;
   s = s.trim();
   const open = s[0] === '{' ? '{' : s[0] === '[' ? '[' : null;
   const close = open === '{' ? '}' : open === '[' ? ']' : null;
   if (!open) return null;
-  let depth = 0;
+  let d = 0;
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
-    if (c === open) depth++;
-    else if (c === close) { depth--; if (depth === 0) return s.slice(0, i + 1); }
+    if (c === open) d++;
+    else if (c === close) { d--; if (d === 0) return s.slice(0, i + 1); }
   }
   return null;
 }
@@ -129,15 +131,12 @@ function extractEmbeddedJson(html) {
   const blobs = [];
   let m;
 
-  // window.__DATA__ = {...};
   const reWin = /window\.__DATA__\s*=\s*([\s\S]+?);[\r\n]/g;
   while ((m = reWin.exec(html))) { const j = balanceJson(m[1]); if (j) blobs.push(j); }
 
-  // <script type="application/json">...</script>
   const reScript = /<script[^>]*type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/gi;
   while ((m = reScript.exec(html))) { const j = balanceJson(m[1]); if (j) blobs.push(j); }
 
-  // const Ziggy = {...};
   const reZiggy = /const\s+Ziggy\s*=\s*([\s\S]+?);[\r\n]/g;
   while ((m = reZiggy.exec(html))) { const j = balanceJson(m[1]); if (j) blobs.push(j); }
 
@@ -180,12 +179,13 @@ function pickKeywordsFromDom(html) {
   const $ = cheerio.load(html);
   const out = new Set();
 
-  // tablas con cabecera "Keywords"
+  // tabla visible
   $('table').each((_, tbl) => {
-    const th0 = cheerio.load($.html(tbl))('th').first().text().toLowerCase();
+    const $tbl = cheerio.load($.html(tbl));
+    const th0 = $tbl('th').first().text().toLowerCase();
     if (th0.includes('keyword') || th0.includes('keywords')) {
-      cheerio.load($.html(tbl))('tbody tr').each((__, tr) => {
-        const first = cheerio.load($.html(tr))('td').first().text().trim();
+      $tbl('tbody tr').each((__, tr) => {
+        const first = cheerio.load($tbl.html(tr))('td').first().text().trim();
         if (first) out.add(first);
       });
     }
@@ -199,16 +199,16 @@ function pickKeywordsFromDom(html) {
   return Array.from(out);
 }
 
-// ===== Keyword Tool por HTML renderizado =====
+// ===== Scraper principal: Keyword Tool DOM render =====
 async function fetchKeywordToolKeywords({ q, country, marketplace }) {
   await loginIfNeeded(false);
 
   const url = `https://members.erank.com/keyword-tool?country=${encodeURIComponent(country)}&source=${encodeURIComponent(marketplace)}&keyword=${encodeURIComponent(q)}`;
 
-  // 2 intentos con waits crecientes y wait_for a la tabla
-  const waits = [20000, 25000];
+  // Tres intentos dentro del timeout total
+  const waits = [18000, 22000, 28000];
   for (const w of waits) {
-    const zr = await zenrowsGet(url, { wait: w, wait_for: 'table,tbody tr,div[role="table"]', country: 'us' }, { Cookie: cookieHeader() });
+    const zr = await zenrowsGet(url, { wait: w, country: 'us' }, { Cookie: cookieHeader() });
     const html = typeof zr.data === 'string' ? zr.data : (zr.data?.html || '');
     if (!html) continue;
 
@@ -219,7 +219,7 @@ async function fetchKeywordToolKeywords({ q, country, marketplace }) {
       if (kw.length) return { source: url, results: kw };
     }
 
-    // b) DOM visible
+    // b) DOM
     const domKw = pickKeywordsFromDom(html).filter(s => s && s.length <= 64);
     if (domKw.length) return { source: url, results: domKw };
   }
@@ -243,6 +243,7 @@ app.get('/erank/keywords', async (req, res) => {
   }
 });
 
+// Muestra scripts y ayuda a afinar selectores/esperas
 app.get('/erank/inspect', async (req, res) => {
   try {
     const q           = String(req.query.q || 'planner');
@@ -250,7 +251,7 @@ app.get('/erank/inspect', async (req, res) => {
     const marketplace = String(req.query.marketplace || 'etsy');
     await loginIfNeeded(false);
     const url = `https://members.erank.com/keyword-tool?country=${encodeURIComponent(country)}&source=${encodeURIComponent(marketplace)}&keyword=${encodeURIComponent(q)}`;
-    const zr  = await zenrowsGet(url, { wait: 25000, wait_for: 'table,tbody tr,div[role="table"]' }, { Cookie: cookieHeader() });
+    const zr  = await zenrowsGet(url, { wait: 28000 }, { Cookie: cookieHeader() });
     const html = typeof zr.data === 'string' ? zr.data : (zr.data?.html || '');
     const $ = cheerio.load(html || '');
     const scripts = [];
@@ -262,6 +263,21 @@ app.get('/erank/inspect', async (req, res) => {
   } catch (e) { res.status(502).json({ error: String(e.message || e) }); }
 });
 
+// Devuelve HTML truncado para ver si ya hay tabla o app montada
+app.get('/erank/raw', async (req, res) => {
+  try {
+    const q           = String(req.query.q || 'planner');
+    const country     = String(req.query.country || 'USA');
+    const marketplace = String(req.query.marketplace || 'etsy');
+    await loginIfNeeded(false);
+    const url = `https://members.erank.com/keyword-tool?country=${encodeURIComponent(country)}&source=${encodeURIComponent(marketplace)}&keyword=${encodeURIComponent(q)}`;
+    const zr  = await zenrowsGet(url, { wait: 28000 }, { Cookie: cookieHeader() });
+    const html = typeof zr.data === 'string' ? zr.data : (zr.data?.html || '');
+    res.json({ url, ok: !!html, preview: String(html).slice(0, 2000) });
+  } catch (e) { res.status(502).json({ error: String(e.message || e) }); }
+});
+
+// Debug simple sobre la sección PATH
 app.get('/erank/debug', async (_req, res) => {
   try {
     await loginIfNeeded(false);
