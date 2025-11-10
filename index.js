@@ -1,4 +1,5 @@
-// index.js — eRank scraper sólido: login Sanctum + JSON embebido en HTML (Inertia) + fallback DOM
+// index.js — eRank JSON+HTML (Inertia-safe) via Playwright (Sanctum login)
+
 globalThis.File = globalThis.File || class File {};
 
 const express = require("express");
@@ -10,19 +11,12 @@ const port = process.env.PORT || 3000;
 
 const EMAIL = (process.env.ERANK_EMAIL || "").trim();
 const PASS  = (process.env.ERANK_PASSWORD || "").trim();
-const UA    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36";
+const UA    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,like Gecko) Chrome/122 Safari/537.36";
 
 let browser, ctx;
 let lastLoginAt = 0;
 
-// --- util: normalizar país ---
-function normCountry(c) {
-  const m = String(c || "").toUpperCase();
-  if (m === "USA") return "US";
-  return m;
-}
-
-// ---------- 1) Login Sanctum (API, sin teclado) ----------
+// ---------- 1) Login Sanctum ----------
 async function ensureContextLogged(force = false) {
   const fresh = (Date.now() - lastLoginAt) < 20 * 60 * 1000;
   if (!force && fresh && ctx) return ctx;
@@ -46,285 +40,165 @@ async function ensureContextLogged(force = false) {
   const state = await rq.storageState();
   await rq.dispose();
 
-  if (!browser) {
-    browser = await chromium.launch({
-      headless: true,
-      args: ["--no-sandbox","--disable-dev-shm-usage"]
-    });
-  }
+  if (!browser)
+    browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
+
   if (ctx) await ctx.close();
   ctx = await browser.newContext({ userAgent: UA, storageState: state });
   lastLoginAt = Date.now();
   return ctx;
 }
 
-// ---------- 2) Extraer JSON embebido desde keyword-tool ----------
-async function extractFromKeywordTool(context, { q, country, source }) {
-  // abrir la página real (no el endpoint)
-  const toolUrl = `https://members.erank.com/keyword-tool?country=${encodeURIComponent(country)}&source=${encodeURIComponent(source)}&keyword=${encodeURIComponent(q)}`;
-  const page = await context.newPage();
-  await page.goto(toolUrl, { waitUntil: "domcontentloaded", timeout: 180000 });
+// ---------- 2) Llamadas eRank robustas ----------
+async function callErank(pathname, query = {}) {
+  const qs = new URLSearchParams(query || {}).toString();
+  const url = `https://members.erank.com/${pathname}${qs ? "?" + qs : ""}`;
+  const headers = {
+    "Accept": "application/json, text/plain, */*",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": "https://members.erank.com/keyword-tool",
+    "User-Agent": UA
+  };
 
-  // Dentro de la página: intentar varias fuentes de JSON embebido (Inertia / script JSON / window.__*)
-  const payload = await page.evaluate(() => {
-    const result = { dataPage: null, scripts: [], globals: {} };
+  const context = await ensureContextLogged();
+  const state = await context.storageState();
+  const rqc = await request.newContext({ extraHTTPHeaders: headers, storageState: state });
 
-    // 1) Inertia: data-page
-    const el = document.querySelector("[data-page]");
-    if (el) {
-      try { result.dataPage = JSON.parse(el.getAttribute("data-page") || "null"); } catch {}
-    }
+  const r = await rqc.get(url);
+  const code = r.status();
+  const ct = r.headers()["content-type"] || "";
+  const text = await r.text();
+  await rqc.dispose();
 
-    // 2) <script type="application/json">
-    document.querySelectorAll('script[type="application/json"]').forEach(s => {
-      try { result.scripts.push(JSON.parse(s.textContent || "null")); } catch {}
-    });
+  // Si no es JSON, hacer fallback con navegador
+  if (!ct.includes("application/json")) {
+    const page = await context.newPage();
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 180000 });
+    const html = await page.content();
+    await page.close();
+    return { url, html, json: null };
+  }
 
-    // 3) window.__* variables con JSON
-    try {
-      for (const k of Object.getOwnPropertyNames(window)) {
-        if (k.startsWith("__") || k.startsWith("ERANK") || k.includes("INITIAL")) {
-          const v = window[k];
-          if (v && (typeof v === "object" || typeof v === "string")) {
-            result.globals[k] = v;
-          }
-        }
-      }
-    } catch {}
-
-    return result;
-  });
-
-  // HTML completo por si hace falta scrapping DOM
-  const html = await page.content();
-  await page.close();
-
-  return { toolUrl, payload, html };
+  try {
+    const json = JSON.parse(text);
+    return { url, json, html: null };
+  } catch {
+    return { url, json: null, html: text };
+  }
 }
 
-// ---------- 3) Unificar lectura: endpoint JSON directo o extracción desde la página ----------
-async function getErankData({ q, country, source }) {
-  const context = await ensureContextLogged();
-  country = normCountry(country);
+// ---------- 3) Parsers seguros ----------
+function extractKeywords(payload) {
+  if (!payload) return [];
+  if (Array.isArray(payload)) return payload.map(x => x.keyword || x.name || x.title || "").filter(Boolean);
 
-  // 3.1 Primero, abrir la página y extraer JSON embebido (más fiable porque tus logs muestran siempre HTML)
-  const { toolUrl, payload, html } = await extractFromKeywordTool(context, { q, country, source });
-
-  // Intenta encontrar colecciones en el JSON embebido (Inertia/props/…)
-  function fromEmbedded() {
-    const buckets = { related: [], near: [], top: [], stats: {} };
-
-    const candidates = [];
-    if (payload?.dataPage) candidates.push(payload.dataPage);
-    if (Array.isArray(payload?.scripts)) candidates.push(...payload.scripts);
-    if (payload?.globals) candidates.push(payload.globals);
-
-    const collectStrings = (arr, into) => {
-      for (const s of arr) {
-        const t = (s || "").toString().trim();
-        if (t) into.add(t);
-      }
-    };
-
-    const relatedSet = new Set();
-    const nearSet = new Set();
-    const topArr = [];
-    let statsObj = {};
-
-    const visit = (node) => {
-      if (!node) return;
-
-      // Heurísticas: busca arrays con keywords, terms, nearMatches, topListings, etc.
-      if (Array.isArray(node)) {
-        // ¿parecen near/related?
-        const maybeStrings = node.filter(v => typeof v === "string" || (typeof v === "object" && (v.keyword || v.term || v.name || v.title)));
-        if (maybeStrings.length >= 1) {
-          const tmp = [];
-          for (const it of maybeStrings) {
-            if (typeof it === "string") tmp.push(it);
-            else tmp.push(it.keyword || it.term || it.name || it.title);
-          }
-          collectStrings(tmp, relatedSet); // luego diferenciamos por endpoints
-        }
-        // ¿parecen top listings?
-        const maybeListings = node.filter(v => v && (v.url || v.link) && (v.title || v.name));
-        if (maybeListings.length) {
-          for (const it of maybeListings) {
-            topArr.push({
-              title: String(it.title || it.name || "").trim(),
-              url: String(it.url || it.link || "").trim(),
-              price: it.price || "",
-              shop: it.shop || ""
-            });
-          }
-        }
-      } else if (typeof node === "object") {
-        // Si hay claves muy obvias
-        for (const [k, v] of Object.entries(node)) {
-          const kk = k.toLowerCase();
-          if (kk.includes("related") || kk.includes("suggestion") || kk.includes("keywords")) {
-            if (Array.isArray(v)) {
-              const tmp = v.map(it => typeof it === "string" ? it : (it?.keyword || it?.term || it?.name || it?.title || ""));
-              collectStrings(tmp, relatedSet);
-            }
-          }
-          if (kk.includes("near") || kk.includes("matches")) {
-            if (Array.isArray(v)) {
-              const tmp = v.map(it => typeof it === "string" ? it : (it?.keyword || it?.term || it?.name || it?.title || ""));
-              collectStrings(tmp, nearSet);
-            }
-          }
-          if (kk.includes("top") && kk.includes("listing")) {
-            if (Array.isArray(v)) {
-              for (const it of v) {
-                topArr.push({
-                  title: String(it?.title || it?.name || "").trim(),
-                  url: String(it?.url || it?.link || "").trim(),
-                  price: it?.price || "",
-                  shop: it?.shop || ""
-                });
-              }
-            }
-          }
-          if (kk.includes("stat") || kk.includes("metrics")) {
-            if (typeof v === "object") statsObj = { ...statsObj, ...v };
-          }
-          // Recursivo
-          if (v && (typeof v === "object")) visit(v);
-        }
-      }
-    };
-
-    for (const c of candidates) visit(c);
-
-    buckets.related = Array.from(relatedSet).filter(Boolean);
-    buckets.near = Array.from(nearSet).filter(Boolean);
-    buckets.top = topArr.filter(x => x.url || x.title);
-    buckets.stats = statsObj;
-
-    return { toolUrl, ...buckets };
+  if (payload.props) {
+    const props = payload.props;
+    const data = props.keywords || props.data || props.results || [];
+    if (Array.isArray(data))
+      return data.map(x => x.keyword || x.name || x.title || "").filter(Boolean);
   }
 
-  const embedded = fromEmbedded();
+  if (payload.data && Array.isArray(payload.data))
+    return payload.data.map(x => x.keyword || x.name || x.title || "").filter(Boolean);
 
-  // Si no hay nada en embebido, intentar scraping DOM básico
-  if (!embedded.related.length && !embedded.near.length && !embedded.top.length && !Object.keys(embedded.stats || {}).length) {
-    const $ = cheerio.load(html);
-    const rel = new Set();
-    $("table tbody tr").each((_, tr) => { const t = $(tr).find("td").first().text().trim(); if (t) rel.add(t); });
-    $("[class*=chip],[class*=tag],[data-testid*=keyword],a[href*='keyword=']").each((_, el) => { const t = $(el).text().trim(); if (t) rel.add(t); });
+  return [];
+}
 
-    const top = [];
-    $("a[href*='etsy.com/listing/']").each((_, a) => {
-      const title = $(a).text().trim();
-      const url = $(a).attr("href") || "";
-      if (url) top.push({ title, url });
-    });
-
-    return { toolUrl, related: Array.from(rel), near: [], top, stats: {} };
-  }
-
-  return embedded;
+function extractFromHTML(html) {
+  const $ = cheerio.load(html || "");
+  const out = new Set();
+  $("table tbody tr").each((_, tr) => {
+    const t = $(tr).find("td").first().text().trim();
+    if (t) out.add(t);
+  });
+  $("[class*=chip],[class*=tag],[data-testid*=keyword],a[href*='keyword=']").each((_, el) => {
+    const t = $(el).text().trim();
+    if (t) out.add(t);
+  });
+  return Array.from(out);
 }
 
 // ---------- 4) Endpoints ----------
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
-app.get("/erank/healthz", (_req, res) => res.json({ ok: true }));
 
 app.get("/erank/keywords", async (req, res) => {
   try {
     const q = String(req.query.q || "planner");
-    const country = normCountry(req.query.country || "US");
+    const country = String(req.query.country || "USA");
     const source = String(req.query.marketplace || "etsy");
 
-    // 1º: intentar endpoint (por si algún día vuelve el JSON)
-    const ctx = await ensureContextLogged();
-    const headers = {
-      "Accept": "application/json, text/plain, */*",
-      "X-Requested-With": "XMLHttpRequest",
-      "Referer": "https://members.erank.com/keyword-tool",
-      "User-Agent": UA
-    };
-    const urlJson = `https://members.erank.com/related-searches?keyword=${encodeURIComponent(q)}&country=${encodeURIComponent(country)}&source=${encodeURIComponent(source)}`;
-    const r = await ctx.request.get(urlJson, { headers });
-    const ct = r.headers()["content-type"] || "";
-    let results = [];
-    if (r.ok() && ct.includes("application/json")) {
-      const data = await r.json();
-      const arr = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : [];
-      results = arr.map(o => (o?.keyword || o?.name || o?.title || o?.term || o?.text || "").toString().trim()).filter(Boolean);
-    }
+    const { url, json, html } = await callErank("related-searches", { keyword: q, country, source });
 
-    // 2º: si JSON no vino o vino vacío, usa extracción embebida en la página
-    if (!results.length) {
-      const emb = await getErankData({ q, country, source });
-      results = emb.related || [];
-      if (!results.length) results = emb.near || [];
-      if (q) results = results.filter(s => s.toLowerCase().includes(q.toLowerCase()));
-      return res.json({ source: emb.toolUrl, query: q, count: results.length, results: results.slice(0, 100) });
-    }
+    let results = extractKeywords(json);
+    if (!results.length && html) results = extractFromHTML(html);
 
-    res.json({ source: urlJson, query: q, count: results.length, results: results.slice(0, 100) });
-  } catch (e) { res.status(502).json({ error: String(e.message || e) }); }
-});
-
-app.get("/erank/near-matches", async (req, res) => {
-  try {
-    const q = String(req.query.q || "planner");
-    const country = normCountry(req.query.country || "US");
-    const source = String(req.query.marketplace || "etsy");
-
-    const emb = await getErankData({ q, country, source });
-    const results = emb.near || [];
-    res.json({ source: emb.toolUrl, query: q, count: results.length, results });
-  } catch (e) { res.status(502).json({ error: String(e.message || e) }); }
-});
-
-app.get("/erank/top-listings", async (req, res) => {
-  try {
-    const q = String(req.query.q || "planner");
-    const country = normCountry(req.query.country || "US");
-    const source = String(req.query.marketplace || "etsy");
-
-    const emb = await getErankData({ q, country, source });
-    const items = emb.top || [];
-    res.json({ source: emb.toolUrl, query: q, count: items.length, items });
-  } catch (e) { res.status(502).json({ error: String(e.message || e) }); }
+    res.json({ source: url, query: q, count: results.length, results });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
 });
 
 app.get("/erank/stats", async (req, res) => {
   try {
     const q = String(req.query.q || "planner");
-    const country = normCountry(req.query.country || "US");
+    const country = String(req.query.country || "USA");
     const source = String(req.query.marketplace || "etsy");
-
-    const emb = await getErankData({ q, country, source });
-    const stats = emb.stats || {};
-    res.json({ source: emb.toolUrl, query: q, stats });
-  } catch (e) { res.status(502).json({ error: String(e.message || e) }); }
+    const { url, json, html } = await callErank("stats", { keyword: q, country, source });
+    res.json({ source: url, query: q, stats: json || { htmlLength: html?.length || 0 } });
+  } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
-// Debug: HTML crudo (vista)
+app.get("/erank/top-listings", async (req, res) => {
+  try {
+    const q = String(req.query.q || "planner");
+    const country = String(req.query.country || "USA");
+    const source = String(req.query.marketplace || "etsy");
+    const { url, json, html } = await callErank("top-listings", { keyword: q, country, source });
+    let items = [];
+    if (json?.data && Array.isArray(json.data))
+      items = json.data.map(x => ({ title: x.title, url: x.url })).filter(x => x.title && x.url);
+    if (!items.length && html) {
+      const $ = cheerio.load(html);
+      $("a[href*='etsy.com/listing/']").each((_, a) => {
+        const t = $(a).text().trim(), u = $(a).attr("href");
+        if (u) items.push({ title: t, url: u });
+      });
+    }
+    res.json({ source: url, query: q, count: items.length, items });
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+app.get("/erank/near-matches", async (req, res) => {
+  try {
+    const q = String(req.query.q || "planner");
+    const country = String(req.query.country || "USA");
+    const source = String(req.query.marketplace || "etsy");
+    const { url, json, html } = await callErank("near-matches", { keyword: q, country, source });
+    let results = extractKeywords(json);
+    if (!results.length && html) results = extractFromHTML(html);
+    res.json({ source: url, query: q, count: results.length, results });
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
 app.get("/erank/raw", async (req, res) => {
   try {
     const q = String(req.query.q || "planner");
-    const country = normCountry(req.query.country || "US");
+    const country = String(req.query.country || "USA");
     const source = String(req.query.marketplace || "etsy");
     const context = await ensureContextLogged(false);
     const page = await context.newPage();
     const url = `https://members.erank.com/keyword-tool?country=${encodeURIComponent(country)}&source=${encodeURIComponent(source)}&keyword=${encodeURIComponent(q)}`;
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 180000 });
+    await page.goto(url, { waitUntil: "networkidle", timeout: 120000 });
     const html = await page.content();
     await page.close();
-    res.json({ url, ok: !!html, length: html ? html.length : 0, preview: (html || "").slice(0, 2000) });
-  } catch (e) { res.status(502).json({ error: String(e.message || e) }); }
+    res.json({ url, ok: !!html, length: html.length, preview: html.slice(0, 1000) });
+  } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
 app.get("/", (_req, res) => res.json({
   ok: true,
-  routes: ["/erank/healthz","/erank/keywords","/erank/stats","/erank/top-listings","/erank/near-matches","/erank/raw"]
+  routes: ["/erank/keywords","/erank/stats","/erank/top-listings","/erank/near-matches","/erank/raw"]
 }));
 
-app.listen(port, "0.0.0.0", () => {
-  console.log("✅ Server live on", port);
-});
+app.listen(port, "0.0.0.0", () => console.log("✅ Server online en puerto", port));
