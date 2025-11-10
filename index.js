@@ -16,7 +16,7 @@ const UA    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHT
 let browser, ctx;
 let lastLoginAt = 0;
 
-// ---------- 1) Login Sanctum (API, sin teclado) ----------
+// ---------- 1) Login Sanctum ----------
 async function ensureContextLogged(force = false) {
   const fresh = (Date.now() - lastLoginAt) < 20 * 60 * 1000;
   if (!force && fresh && ctx) return ctx;
@@ -49,7 +49,7 @@ async function ensureContextLogged(force = false) {
   return ctx;
 }
 
-// ---------- 2) Llamadas eRank: intenta JSON; si no, fetch del navegador; si aun así es HTML, lo devuelve ----------
+// ---------- 2) Llamadas eRank con fallback automático ----------
 async function callErank(pathname, query = {}) {
   const full = (u, q) => {
     const qs = new URLSearchParams(q || {}).toString();
@@ -65,7 +65,7 @@ async function callErank(pathname, query = {}) {
 
   const state = await (await ensureContextLogged()).storageState();
 
-  // Intento 1: request.newContext con storageState
+  // Intento 1 — request.newContext
   const rqc = await request.newContext({ storageState: state, extraHTTPHeaders: headers });
   let r, code, ct, bodyText;
   try {
@@ -76,11 +76,12 @@ async function callErank(pathname, query = {}) {
   } finally {
     await rqc.dispose();
   }
+
   if (r.ok() && ct.includes("application/json")) {
     return { url, json: JSON.parse(bodyText), html: null };
   }
 
-  // Intento 2 (fallback): fetch desde dentro del navegador con XSRF
+  // Intento 2 — fetch dentro del navegador (XSRF)
   const page = await (await ensureContextLogged()).newPage();
   await page.goto("https://members.erank.com/keyword-tool", { waitUntil: "domcontentloaded", timeout: 120000 });
   const out = await page.evaluate(async ({ u }) => {
@@ -107,14 +108,14 @@ async function callErank(pathname, query = {}) {
 
   if (out.ok && String(out.type).includes("application/json")) {
     try { return { url, json: JSON.parse(out.text), html: null }; }
-    catch { /* cae abajo y se devuelve como html */ }
+    catch {}
   }
 
-  // Si llegamos aquí, eRank respondió HTML: devolvemos el HTML para que la ruta pueda scrapear
+  // Si todo falla → HTML bruto
   return { url, json: null, html: out.text || bodyText || "" };
 }
 
-// ---------- 3) Helpers de parsing ----------
+// ---------- 3) Helpers ----------
 function pickKeywordsFromJSON(payload) {
   const arr = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload) ? payload : [];
   return arr.map(o => (o?.keyword || o?.name || o?.title || o?.term || o?.text || "").toString().trim()).filter(Boolean);
@@ -131,9 +132,13 @@ function pickTopListingsFromJSON(payload) {
 function pickKeywordsFromHTML(html) {
   const $ = cheerio.load(html);
   const out = new Set();
-  $("table tbody tr").each((_, tr) => { const t = $(tr).find("td").first().text().trim(); if (t) out.add(t); });
+  $("table tbody tr").each((_, tr) => {
+    const t = $(tr).find("td").first().text().trim();
+    if (t) out.add(t);
+  });
   $("[class*=chip],[class*=tag],[data-testid*=keyword],a[href*='keyword=']").each((_, el) => {
-    const t = $(el).text().trim(); if (t) out.add(t);
+    const t = $(el).text().trim();
+    if (t) out.add(t);
   });
   return Array.from(out).filter(Boolean);
 }
@@ -146,20 +151,14 @@ app.get("/erank/keywords", async (req, res) => {
   try {
     const q = String(req.query.q || "planner");
     const country = String(req.query.country || "USA");
-    const marketplace = String(req.query.marketplace || "etsy");
+    const source = String(req.query.marketplace || "etsy");
 
-    const { url, json, html } = await callErank("related-searches", { keyword: q, country, marketplace });
-
+    const { url, json, html } = await callErank("related-searches", { keyword: q, country, source });
     let results = [];
-    if (json) {
-      results = pickKeywordsFromJSON(json);
-    }
-    if (!results.length && html) {
-      results = pickKeywordsFromHTML(html);
-    }
+    if (json) results = pickKeywordsFromJSON(json);
+    if (!results.length && html) results = pickKeywordsFromHTML(html);
     if (q) results = results.filter(s => s.toLowerCase().includes(q.toLowerCase()));
-
-    res.json({ source: url, query: q, count: results.length, results: results.slice(0, 100) });
+    res.json({ source: url, query: q, count: results.length, results: results.slice(0,100) });
   } catch (e) {
     res.status(502).json({ error: String(e.message || e) });
   }
@@ -169,75 +168,57 @@ app.get("/erank/stats", async (req, res) => {
   try {
     const q = String(req.query.q || "planner");
     const country = String(req.query.country || "USA");
-    const marketplace = String(req.query.marketplace || "etsy");
-
-    const { url, json } = await callErank("stats", { keyword: q, country, marketplace });
+    const source = String(req.query.marketplace || "etsy");
+    const { url, json } = await callErank("stats", { keyword: q, country, source });
     if (!json) throw new Error("Stats no devolvió JSON");
     res.json({ source: url, query: q, stats: json });
-  } catch (e) {
-    res.status(502).json({ error: String(e.message || e) });
-  }
+  } catch (e) { res.status(502).json({ error: String(e.message || e) }); }
 });
 
 app.get("/erank/top-listings", async (req, res) => {
   try {
     const q = String(req.query.q || "planner");
     const country = String(req.query.country || "USA");
-    const marketplace = String(req.query.marketplace || "etsy");
-
-    const { url, json, html } = await callErank("top-listings", { keyword: q, country, marketplace });
-
+    const source = String(req.query.marketplace || "etsy");
+    const { url, json, html } = await callErank("top-listings", { keyword: q, country, source });
     let items = [];
-    if (json) {
-      items = pickTopListingsFromJSON(json);
-    }
+    if (json) items = pickTopListingsFromJSON(json);
     if (!items.length && html) {
-      // Fallback muy básico desde HTML (si cambian el layout, seguirá vacío)
       const $ = cheerio.load(html);
-      items = [];
       $("a[href*='etsy.com/listing/']").each((_, a) => {
         const title = $(a).text().trim();
         const url = $(a).attr("href") || "";
         if (url) items.push({ title, url });
       });
     }
-
     res.json({ source: url, query: q, count: items.length, items });
-  } catch (e) {
-    res.status(502).json({ error: String(e.message || e) });
-  }
+  } catch (e) { res.status(502).json({ error: String(e.message || e) }); }
 });
 
 app.get("/erank/near-matches", async (req, res) => {
   try {
     const q = String(req.query.q || "planner");
     const country = String(req.query.country || "USA");
-    const marketplace = String(req.query.marketplace || "etsy");
-
-    const { url, json } = await callErank("near-matches", { keyword: q, country, marketplace });
+    const source = String(req.query.marketplace || "etsy");
+    const { url, json } = await callErank("near-matches", { keyword: q, country, source });
     const results = json ? pickKeywordsFromJSON(json) : [];
     res.json({ source: url, query: q, count: results.length, results });
-  } catch (e) {
-    res.status(502).json({ error: String(e.message || e) });
-  }
+  } catch (e) { res.status(502).json({ error: String(e.message || e) }); }
 });
 
-// Debug: HTML crudo del Keyword Tool
 app.get("/erank/raw", async (req, res) => {
   try {
     const q = String(req.query.q || "planner");
     const country = String(req.query.country || "USA");
-    const marketplace = String(req.query.marketplace || "etsy");
+    const source = String(req.query.marketplace || "etsy");
     const context = await ensureContextLogged(false);
     const page = await context.newPage();
-    const url = `https://members.erank.com/keyword-tool?country=${encodeURIComponent(country)}&source=${encodeURIComponent(marketplace)}&keyword=${encodeURIComponent(q)}`;
+    const url = `https://members.erank.com/keyword-tool?country=${encodeURIComponent(country)}&source=${encodeURIComponent(source)}&keyword=${encodeURIComponent(q)}`;
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
     const html = await page.content();
     await page.close();
     res.json({ url, ok: !!html, length: html ? html.length : 0, preview: (html || "").slice(0, 2000) });
-  } catch (e) {
-    res.status(502).json({ error: String(e.message || e) });
-  }
+  } catch (e) { res.status(502).json({ error: String(e.message || e) }); }
 });
 
 app.get("/", (_req, res) => res.json({
