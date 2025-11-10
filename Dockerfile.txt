@@ -1,17 +1,25 @@
-FROM node:18
+# Imagen oficial de Playwright con Chromium y dependencias listas
+FROM mcr.microsoft.com/playwright:v1.48.2-jammy
 
-# Crear directorio de trabajo
+# Workdir
 WORKDIR /app
 
-# Copiar dependencias y código
-COPY package.json .
-COPY index.js .
+# Solo copiamos package.json para cachear npm ci
+COPY package*.json ./
 
-# Instalar dependencias
-RUN npm install
+# Instala dependencias de producción
+RUN npm ci --omit=dev
 
-# Exponer el puerto que usará Render
-EXPOSE 3000
+# Copia el código
+COPY . .
 
-# Comando de arranque
+# Variables recomendadas
+ENV NODE_ENV=production
+ENV PORT=10000
+# Playwright ya viene instalado con navegadores en esta imagen
+
+# Expone el puerto
+EXPOSE 10000
+
+# Arranca el servidor
 CMD ["node", "index.js"]
