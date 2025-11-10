@@ -13,10 +13,10 @@ const EMAIL = (process.env.ERANK_EMAIL || "").trim();
 const PASS  = (process.env.ERANK_PASSWORD || "").trim();
 const UA    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,like Gecko) Chrome/122 Safari/537.36";
 
-let browser, ctx;
+let browser, ctx;          // Browser / BrowserContext
 let lastLoginAt = 0;
 
-// ---- 1) Login Sanctum (sin interfaz) ----
+// ---- 1) Login Sanctum (sin UI) ----
 async function ensureContextLogged(force = false) {
   const fresh = (Date.now() - lastLoginAt) < 20 * 60 * 1000;
   if (!force && fresh && ctx) return ctx;
@@ -52,7 +52,7 @@ async function ensureContextLogged(force = false) {
   return ctx;
 }
 
-// ---- 2) Lector JSON con fallback a page.evaluate(fetch) ----
+// ---- 2) Lector JSON con fallback automático (si devuelve HTML) ----
 async function callErankJson(pathname, query = {}) {
   const full = (u, q) => {
     const qs = new URLSearchParams(q || {}).toString();
@@ -66,34 +66,36 @@ async function callErankJson(pathname, query = {}) {
     "User-Agent": UA
   };
 
-  // usamos storageState (cookies + localStorage)
+  // Intento 1: request.newContext con storageState (cookies de la sesión)
   const state = await (await ensureContextLogged()).storageState();
-
-  // nuevo contexto con storageState (reemplaza addCookies)
   const rqc = await request.newContext({
     storageState: state,
     extraHTTPHeaders: headers
   });
 
-  let r = await rqc.get(url);
+  const r = await rqc.get(url);
   const code = r.status();
   const ct = r.headers()["content-type"] || "";
-  if (r.ok() && ct.includes("application/json")) {
-    const data = await r.json();
-    await rqc.dispose();
-    return { url, data };
-  }
+  const textBody = await r.text();
   await rqc.dispose();
 
-  // fallback: usar fetch dentro del navegador
-  const page = await (await ensureContextLogged()).newPage();
+  if (r.ok() && ct.includes("application/json")) {
+    return { url, data: JSON.parse(textBody) };
+  }
+
+  // Intento 2 (fallback): fetch dentro del navegador con XSRF y credenciales
+  const context = await ensureContextLogged(false);
+  const page = await context.newPage();
   await page.goto("https://members.erank.com/keyword-tool", {
     waitUntil: "domcontentloaded",
     timeout: 120000
   });
 
   const out = await page.evaluate(async ({ u }) => {
-    const xsrf = (document.cookie.split(";").map(s => s.trim()).find(s => s.startsWith("XSRF-TOKEN=")) || "").split("=")[1] || "";
+    const xsrf = (document.cookie.split(";")
+      .map(s => s.trim())
+      .find(s => s.startsWith("XSRF-TOKEN=")) || "")
+      .split("=")[1] || "";
     try {
       const resp = await fetch(u, {
         method: "GET",
@@ -106,32 +108,40 @@ async function callErankJson(pathname, query = {}) {
         credentials: "include"
       });
       const type = resp.headers.get("content-type") || "";
-      const body = type.includes("application/json") ? await resp.json() : await resp.text();
-      return { ok: resp.ok && type.includes("application/json"), code: resp.status, body };
+      const body = type.includes("application/json")
+        ? await resp.json()
+        : await resp.text();
+      return { ok: resp.ok, code: resp.status, type, body };
     } catch (e) {
       return { ok: false, code: 0, body: String(e) };
     }
   }, { u: url });
   await page.close();
 
-  if (!out.ok) throw new Error(`JSON ${pathname} ${code} → ${String(out.body).slice(0,180)}`);
+  if (!out.ok || !String(out.type).includes("application/json")) {
+    throw new Error(`JSON ${pathname} ${out.code} → ${String(out.body).slice(0, 180)}`);
+  }
   return { url, data: out.body };
 }
 
 // ---- 3) Auxiliares de parsing ----
 function pickKeywords(payload) {
   const arr = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload) ? payload : [];
-  return arr.map(o => (o?.keyword || o?.name || o?.title || o?.term || o?.text || "").toString().trim()).filter(Boolean);
+  return arr
+    .map(o => (o?.keyword || o?.name || o?.title || o?.term || o?.text || "").toString().trim())
+    .filter(Boolean);
 }
 
 function pickTopListings(payload) {
   const arr = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload) ? payload : [];
-  return arr.map(o => ({
-    title: String(o?.title || o?.name || "").trim(),
-    url:   String(o?.url || o?.link || "").trim(),
-    price: o?.price || "",
-    shop:  o?.shop || ""
-  })).filter(x => x.title || x.url);
+  return arr
+    .map(o => ({
+      title: String(o?.title || o?.name || "").trim(),
+      url:   String(o?.url || o?.link || "").trim(),
+      price: o?.price || "",
+      shop:  o?.shop || ""
+    }))
+    .filter(x => x.title || x.url);
 }
 
 // ---- 4) Endpoints ----
@@ -147,6 +157,7 @@ app.get("/erank/keywords", async (req, res) => {
     let results = pickKeywords(data);
 
     if (!results.length) {
+      // Fallback scraping por si no hay JSON útil
       const context = await ensureContextLogged(false);
       const page = await context.newPage();
       const urlPage = `https://members.erank.com/keyword-tool?country=${encodeURIComponent(country)}&source=${encodeURIComponent(marketplace)}&keyword=${encodeURIComponent(q)}`;
@@ -155,13 +166,19 @@ app.get("/erank/keywords", async (req, res) => {
       await page.close();
       const $ = cheerio.load(html);
       const out = new Set();
-      $("table tbody tr").each((_, tr) => { const t = $(tr).find("td").first().text().trim(); if (t) out.add(t); });
-      $("[class*=chip],[class*=tag],[data-testid*=keyword]").each((_, el) => { const t = $(el).text().trim(); if (t) out.add(t); });
+      $("table tbody tr").each((_, tr) => {
+        const t = $(tr).find("td").first().text().trim();
+        if (t) out.add(t);
+      });
+      $("[class*=chip],[class*=tag],[data-testid*=keyword]").each((_, el) => {
+        const t = $(el).text().trim();
+        if (t) out.add(t);
+      });
       results = Array.from(out).filter(Boolean);
     }
 
     if (q) results = results.filter(s => s.toLowerCase().includes(q.toLowerCase()));
-    res.json({ source: url, query: q, count: results.length, results: results.slice(0,100) });
+    res.json({ source: url, query: q, count: results.length, results: results.slice(0, 100) });
   } catch (e) {
     res.status(502).json({ error: String(e.message || e) });
   }
@@ -199,7 +216,7 @@ app.get("/erank/near-matches", async (req, res) => {
   } catch (e) { res.status(502).json({ error: String(e.message || e) }); }
 });
 
-// ---- /erank/raw ----
+// ---- /erank/raw (debug HTML) ----
 app.get("/erank/raw", async (req, res) => {
   try {
     const q = String(req.query.q || "planner");
@@ -211,7 +228,7 @@ app.get("/erank/raw", async (req, res) => {
     await page.goto(url, { waitUntil: "networkidle", timeout: 180000 });
     const html = await page.content();
     await page.close();
-    res.json({ url, ok: !!html, length: html ? html.length : 0, preview: (html || "").slice(0,2000) });
+    res.json({ url, ok: !!html, length: html ? html.length : 0, preview: (html || "").slice(0, 2000) });
   } catch (e) {
     res.status(502).json({ error: String(e.message || e) });
   }
@@ -220,7 +237,7 @@ app.get("/erank/raw", async (req, res) => {
 // ---- Raíz ----
 app.get("/", (_req, res) => res.json({
   ok: true,
-  routes: ["/erank/healthz","/erank/keywords","/erank/stats","/erank/top-listings","/erank/near-matches","/erank/raw"]
+  routes: ["/erank/healthz", "/erank/keywords", "/erank/stats", "/erank/top-listings", "/erank/near-matches", "/erank/raw"]
 }));
 
 app.listen(port, "0.0.0.0", () => {
