@@ -1,5 +1,5 @@
 // index.js — eRank PRO scraper FINAL
-// Express + Playwright + Cheerio + Stealth + DOM UI Actions + Inertia/Tabla fallback
+// Express + Playwright + Cheerio + Stealth + DOM UI Actions + Inertia/Tabla fallback + XHR capture
 
 // ---------- Núcleo ----------
 const fs = require('fs');
@@ -101,7 +101,7 @@ async function ensureBrowser() {
   context = await browser.newContext(contextOptions);
 
   // Aplica cookies a ambos dominios
-  if ( ERANK_COOKIES ) {
+  if (ERANK_COOKIES) {
     const parsed = cookiesFromString(ERANK_COOKIES);
     const both = [];
     for (const c of parsed) {
@@ -273,85 +273,6 @@ function parseGenericList(html){
 }
 
 // ---------- Scraping/acciones en DOM ----------
-async function scrapeKeywordsInPage(page){
-  return await page.evaluate(()=>{
-    const out=[];
-    const tables=[...document.querySelectorAll('table')];
-    for(const t of tables){
-      const headers=[...t.querySelectorAll('thead th, tr th')].map(th=>th.textContent.trim().toLowerCase());
-      if(!headers.length || !headers.some(h=>h.includes('keyword'))) continue;
-      const kIdx=headers.findIndex(h=>h.includes('keyword'));
-      const vIdx=headers.findIndex(h=>h.includes('search')||h.includes('volume'));
-      const rows=[...t.querySelectorAll('tbody tr, tr')];
-      for(const r of rows){
-        const cells=[...r.querySelectorAll('td')].map(td=>td.textContent.trim());
-        if(!cells.length) continue;
-        const kw=cells[kIdx]||''; const vol=vIdx>=0?(cells[vIdx]||''):'';
-        if(kw) out.push({keyword:kw, volume:vol});
-      }
-    }
-    if(!out.length){
-      document.querySelectorAll('[data-keyword], .keyword, a[href*="/keyword/"]').forEach(el=>{
-        const kw=el.textContent.trim(); if(kw) out.push({keyword:kw});
-      });
-    }
-    return out;
-  });
-}
-async function scrapeTopListingsInPage(page){
-  return await page.evaluate(()=>{
-    const items=[];
-    document.querySelectorAll('a[href*="/listing/"]').forEach(a=>{
-      const href=a.getAttribute('href')||'';
-      const title=a.getAttribute('title')||a.textContent.trim();
-      if(href||title) items.push({title, href});
-    });
-    document.querySelectorAll('[data-listing-id]').forEach(el=>{
-      const id=el.getAttribute('data-listing-id');
-      const title=el.textContent.trim();
-      if(id||title) items.push({listing_id:id, title});
-    });
-    return items;
-  });
-}
-async function scrapeTagsInPage(page){
-  return await page.evaluate(()=>{
-    const tables=[...document.querySelectorAll('table')];
-    for(const t of tables){
-      const headers=[...t.querySelectorAll('thead th, tr th')].map(th=>th.textContent.trim().toLowerCase());
-      if(!headers.length) continue;
-      const hasTag=headers.some(h=>h==='tag');
-      const hasSearch=headers.some(h=>h.includes('search'));
-      if(!hasTag||!hasSearch) continue;
-      const idx={
-        tag: headers.findIndex(h=>h==='tag'),
-        avgS:headers.findIndex(h=>h.includes('search')),
-        avgC:headers.findIndex(h=>h.includes('click')),
-        ctr: headers.findIndex(h=>h.includes('ctr')),
-        comp:headers.findIndex(h=>h.includes('competition')||h.includes('etsy')),
-        trend:headers.findIndex(h=>h.includes('trend'))
-      };
-      const rows=[];
-      [...t.querySelectorAll('tbody tr, tr')].forEach(tr=>{
-        const tds=[...tr.querySelectorAll('td')].map(td=>td.textContent.trim());
-        if(!tds.length) return;
-        const row={
-          tag: tds[idx.tag]||'',
-          avg_searches: idx.avgS>=0?(tds[idx.avgS]||''):'',
-          avg_clicks:   idx.avgC>=0?(tds[idx.avgC]||''):'',
-          avg_ctr:      idx.ctr >=0?(tds[idx.ctr ]||''):'',
-          etsy_competition: idx.comp>=0?(tds[idx.comp]||''):'',
-          search_trend: idx.trend>=0?(tds[idx.trend]||''):''
-        };
-        if(row.tag) rows.push(row);
-      });
-      if(rows.length) return rows;
-    }
-    return [];
-  });
-}
-
-// ---------- Acciones de UI ----------
 // NUEVA: usa el placeholder real y Enter; ignora inputs ocultos
 async function typeAndSearch(page, q) {
   try {
@@ -407,6 +328,31 @@ async function autoScroll(page, steps = 6) {
   }
 }
 
+// ---------- Helpers de captura XHR ----------
+function findArraysDeep(obj, pred, acc = []) {
+  if (!obj || typeof obj !== 'object') return acc;
+  if (Array.isArray(obj) && obj.some(pred)) acc.push(obj);
+  for (const k of Object.keys(obj)) findArraysDeep(obj[k], pred, acc);
+  return acc;
+}
+async function captureJson(page, pred, timeMs = 3000) {
+  const bucket = [];
+  const handler = async (r) => {
+    try {
+      const ct = (r.headers()['content-type'] || '').toLowerCase();
+      if (!ct.includes('application/json')) return;
+      const txt = await r.text();
+      const json = JSON.parse(txt);
+      const arrays = findArraysDeep(json, pred);
+      if (arrays.length) bucket.push({ json, arrays });
+    } catch {}
+  };
+  page.on('response', handler);
+  await page.waitForTimeout(timeMs);
+  page.off('response', handler);
+  return bucket;
+}
+
 // ---------- Middlewares ----------
 app.use((req, _res, next) => { if (req.url.includes('//')) req.url = req.url.replace(/\/{2,}/g, '/'); next(); });
 app.use(async (_req, _res, next) => { await jitter(); next(); });
@@ -432,7 +378,7 @@ app.get('/erank/raw', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ---------- Endpoints principales ----------
+// ---------- Endpoints: KEYWORDS ----------
 app.get('/erank/keywords', async (req, res) => {
   const q = (req.query.q || '').toString().trim();
   const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
@@ -441,19 +387,51 @@ app.get('/erank/keywords', async (req, res) => {
 
   try {
     const out = await withRetries(async () => {
-      await ensureBrowser(); const page = await context.newPage(); await loginIfNeeded(page);
+      await ensureBrowser();
+      const page = await context.newPage();
+      await loginIfNeeded(page);
+
       await openAndEnsure(page, `${BASE}/keyword-tool`, `${BASE}/dashboard`);
       await ensureMarketplaceCountry(page, marketplace, country);
       await typeAndSearch(page, q);
-      let results = await scrapeKeywordsInPage(page);
-      if (!results.length) { const html = await page.content(); results = parseKeywords(html).results; }
+
+      // Captura JSON mientras hidrata
+      const cap = await captureJson(page, (x) => x && typeof x === 'object' && ('keyword' in x || 'term' in x), 2500);
+
+      await page.waitForTimeout(500);
+      await autoScroll(page, 3);
+
+      let results = [];
+      for (const hit of cap) {
+        for (const arr of hit.arrays) {
+          for (const o of arr) {
+            const kw = (o.keyword || o.term || '').toString().trim();
+            const vol = (o.volume || o.searches || o.avg_searches || '').toString().trim();
+            if (kw) results.push({ keyword: kw, volume: vol });
+          }
+        }
+      }
+
+      // Fallback DOM/HTML
+      if (!results.length) {
+        await page.waitForSelector('table tbody tr td, [data-keyword]', { timeout: 4000 }).catch(()=>{});
+        results = await scrapeKeywordsInPage(page);
+        if (!results.length) {
+          const html = await page.content();
+          results = parseKeywords(html).results;
+        }
+      }
+
       await page.close();
       return { query: q, country, marketplace, count: results.length, results };
     }, 'keywords-ui');
     res.json(out);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
+// ---------- Endpoints: NEAR MATCHES ----------
 app.get('/erank/near-matches', async (req, res) => {
   const q = (req.query.q || '').toString().trim();
   const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
@@ -462,16 +440,21 @@ app.get('/erank/near-matches', async (req, res) => {
 
   try {
     const out = await withRetries(async () => {
-      await ensureBrowser(); const page = await context.newPage(); await loginIfNeeded(page);
+      await ensureBrowser();
+      const page = await context.newPage();
+      await loginIfNeeded(page);
       const url = `${BASE}/keyword-tool?q=${encodeURIComponent(q)}&tab=near-matches&country=${country}&marketplace=${marketplace}`;
       await openAndEnsure(page, url, `${BASE}/keyword-tool`);
       const html = await page.content(); await page.close();
       return { query: q, country, marketplace, ...parseGenericList(html) };
     }, 'near-matches');
     res.json(out);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
+// ---------- Endpoints: TOP LISTINGS ----------
 app.get('/erank/top-listings', async (req, res) => {
   const q = (req.query.q || '').toString().trim();
   const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
@@ -480,11 +463,15 @@ app.get('/erank/top-listings', async (req, res) => {
 
   try {
     const out = await withRetries(async () => {
-      await ensureBrowser(); const page = await context.newPage(); await loginIfNeeded(page);
+      await ensureBrowser();
+      const page = await context.newPage();
+      await loginIfNeeded(page);
+
       await openAndEnsure(page, `${BASE}/keyword-tool`, `${BASE}/dashboard`);
       await ensureMarketplaceCountry(page, marketplace, country);
       await typeAndSearch(page, q);
 
+      // Abre pestaña TL
       const tab = page.getByRole('tab', { name: /top listings/i });
       if (await tab.isVisible().catch(()=>false)) {
         await tab.click().catch(()=>{}); await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(()=>{});
@@ -493,126 +480,108 @@ app.get('/erank/top-listings', async (req, res) => {
         await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(()=>{});
       }
 
-      let results = await scrapeTopListingsInPage(page);
-      if (!results.length) { const html = await page.content(); results = parseTopListings(html).results; }
+      // Captura JSON de listados
+      const cap = await captureJson(page, (x) => x && typeof x === 'object' && ('listing_id' in x || 'title' in x || 'url' in x), 2500);
+
+      await page.waitForTimeout(500);
+      await autoScroll(page, 3);
+
+      let results = [];
+      for (const hit of cap) {
+        for (const arr of hit.arrays) {
+          for (const o of arr) {
+            const title = (o.title || o.name || '').toString().trim();
+            const href  = (o.url || '').toString().trim();
+            const id    = o.listing_id;
+            if (title || href || id) results.push({ listing_id: id, title, href });
+          }
+        }
+      }
+
+      if (!results.length) {
+        results = await scrapeTopListingsInPage(page);
+        if (!results.length) {
+          const html = await page.content();
+          results = parseTopListings(html).results;
+        }
+      }
 
       await page.close();
       return { query: q, country, marketplace, count: results.length, results };
     }, 'top-listings-ui');
     res.json(out);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
+// ---------- Otros endpoints ----------
 app.get('/erank/stats', async (_req, res) => {
   try {
     const out = await withRetries(async () => {
-      await ensureBrowser(); const page = await context.newPage(); await loginIfNeeded(page);
+      await ensureBrowser();
+      const page = await context.newPage();
+      await loginIfNeeded(page);
       await openAndEnsure(page, `${BASE}/dashboard`, pick(REFERERS));
-      const html = await page.content(); await page.close();
+      const html = await page.content();
+      await page.close();
       return { ok: true, ...htmlStats(html) };
     }, 'stats');
     res.json(out);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/erank/my-shop', async (_req, res) => {
   try {
     const out = await withRetries(async () => {
-      await ensureBrowser(); const page = await context.newPage(); await loginIfNeeded(page);
+      await ensureBrowser();
+      const page = await context.newPage();
+      await loginIfNeeded(page);
       await openAndEnsure(page, `${BASE}/dashboard`, pick(REFERERS));
-      const html = await page.content(); await page.close();
+      const html = await page.content();
+      await page.close();
       return parseMyShop(html);
     }, 'my-shop');
     res.json(out);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/erank/products', async (_req, res) => {
   try {
     const out = await withRetries(async () => {
-      await ensureBrowser(); const page = await context.newPage(); await loginIfNeeded(page);
+      await ensureBrowser();
+      const page = await context.newPage();
+      await loginIfNeeded(page);
       await openAndEnsure(page, `${BASE}/listings/active`, `${BASE}/dashboard`);
-      const html = await page.content(); await page.close();
+      const html = await page.content();
+      await page.close();
       return parseGenericList(html);
     }, 'products');
     res.json(out);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/erank/competitors', async (_req, res) => {
   try {
     const out = await withRetries(async () => {
-      await ensureBrowser(); const page = await context.newPage(); await loginIfNeeded(page);
+      await ensureBrowser();
+      const page = await context.newPage();
+      await loginIfNeeded(page);
       await openAndEnsure(page, `${BASE}/competitor-research`, `${BASE}/dashboard`);
-      const html = await page.content(); await page.close();
+      const html = await page.content();
+      await page.close();
       return parseGenericList(html);
     }, 'competitors');
     res.json(out);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// Tags con acciones de UI (scroll) + fallback
-app.get('/erank/tags', async (req, res) => {
-  const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
-  try {
-    await ensureBrowser(); const page = await context.newPage(); await loginIfNeeded(page);
-    await openAndEnsure(page, `${BASE}/tags?country=${country}`, `${BASE}/dashboard`);
-
-    await autoScroll(page, 8); // fuerza hidratación
-
-    let rows = await scrapeTagsInPage(page);
-    if (!rows.length) {
-      const html = await page.content();
-      const $ = cheerio.load(html);
-      const tbl = tableByHeaders($, [/^tag$/, /avg.*search|searches/, /clicks|ctr|click/]);
-      if (tbl) {
-        const idx = {
-          tag:  tbl.header.findIndex(h => /^tag$/.test(h)),
-          avgS: tbl.header.findIndex(h => /(avg.*search|searches)/.test(h)),
-          avgC: tbl.header.findIndex(h => /(avg.*click|clicks)/.test(h)),
-          ctr:  tbl.header.findIndex(h => /ctr/.test(h)),
-          comp: tbl.header.findIndex(h => /(competition|etsy)/.test(h)),
-          trend:tbl.header.findIndex(h => /(trend)/.test(h)),
-        };
-        rows = tbl.rows.map(r => ({
-          tag: r[idx.tag] || '',
-          avg_searches:     idx.avgS>=0 ? (r[idx.avgS] || '') : '',
-          avg_clicks:       idx.avgC>=0 ? (r[idx.avgC] || '') : '',
-          avg_ctr:          idx.ctr >=0 ? (r[idx.ctr ] || '') : '',
-          etsy_competition: idx.comp>=0 ? (r[idx.comp] || '') : '',
-          search_trend:     idx.trend>= 0? (r[idx.trend]|| '') : ''
-        })).filter(x => x.tag);
-      }
-    }
-
-    await page.close();
-    res.json({ country, count: rows.length, results: rows });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/erank/trend-buzz', async (req, res) => {
-  const country = (req.query.country || 'USA').toUpperCase();
-  const marketplace = (req.query.marketplace || 'Etsy');
-  const tab = (req.query.tab || 'keywords').toLowerCase(); // keywords|products|colors|recipients|styles|materials
-  try {
-    const out = await withRetries(async () => {
-      await ensureBrowser(); const page = await context.newPage(); await loginIfNeeded(page);
-      await openAndEnsure(page, `${BASE}/trend-buzz`, `${BASE}/dashboard`);
-      await page.getByRole('button', { name: /marketplace/i }).click().catch(()=>{});
-      await page.getByRole('option', { name: new RegExp(`^${marketplace}$`, 'i') }).click().catch(()=>{});
-      await jitter();
-      await page.getByRole('button', { name: /country/i }).click().catch(()=>{});
-      await page.getByRole('option', { name: new RegExp(`^${country}$`, 'i') }).click().catch(()=>{});
-      await jitter();
-      const tabBtn = page.getByRole('tab', { name: new RegExp(`^${tab}$`, 'i') });
-      if (await tabBtn.isVisible().catch(()=>false)) {
-        await tabBtn.click().catch(()=>{}); await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(()=>{}); await jitter();
-      }
-      const html = await page.content(); await page.close();
-      return { marketplace, country, tab, ...parseGenericList(html) };
-    }, 'trend-buzz');
-    res.json(out);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ---------- Debug screenshots ----------
