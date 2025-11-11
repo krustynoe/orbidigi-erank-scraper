@@ -1,5 +1,5 @@
 // index.js — eRank PRO scraper FINAL
-// Express + Playwright + Cheerio + Stealth + DOM UI Actions + Inertia/Tabla fallback + XHR capture
+// Express + Playwright + Cheerio + Stealth + DOM UI Actions + Inertia/Tabla fallback + XHR capture + Normalizers
 
 // ---------- Núcleo ----------
 const fs = require('fs');
@@ -8,7 +8,7 @@ const express = require('express');
 const cheerio = require('cheerio');
 const { chromium } = require('playwright');
 
-const app = express();
+const app = new express.Router ? express() : require('express')(); // safe create
 const port = process.env.PORT || 3000;
 
 // ---------- Constantes ----------
@@ -57,7 +57,7 @@ let consecutiveErrors = 0;
 // ---------- Utils ----------
 const rand   = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 const sleep  = (ms) => new Promise(r => setTimeout(r, ms));
-const pick   = (arr) => arr[rand(0, arr.length - 1)];
+const pick   = (arr) => arr[Math.max(0, Math.min(arr.length - 1, Math.floor(Math.random() * arr.length)))];
 const jitter = async () => { if (STEALTH_ON) await sleep(rand(STEALTH_MIN_MS, STEALTH_MAX_MS)); };
 
 function cookiesFromString(cookieStr) {
@@ -93,7 +93,7 @@ async function ensureBrowser() {
   const contextOptions = {
     baseURL: BASE,
     userAgent: ua,
-    locale: lang.startsWith('es') ? 'es-ES' : 'en-US',
+    locale: lang.startsWith('e') ? lang : 'en-US',
     extraHTTPHeaders: { 'accept-language': lang, 'upgrade-insecure-requests': '1' }
   };
   if (fs.existsSync(STORAGE)) contextOptions.storageState = STORAGE;
@@ -105,8 +105,8 @@ async function ensureBrowser() {
     const parsed = cookiesFromString(ERANK_COOKIES);
     const both = [];
     for (const c of parsed) {
-      both.push({ ...c, domain: 'members.erank.com', sameSite: 'None' });
-      both.push({ ...c, domain: '.erank.com',        sameSite: 'None' });
+      both.push({ ... c, domain: 'members.erank.com', sameSite: 'None' });
+      both.push({ ... c, domain: '.erank.com',        sameSite: 'None' });
     }
     try { await context.addCookies(both); } catch (e) { console.error('addCookies:', e.message); }
   }
@@ -136,7 +136,7 @@ async function isLoggedIn(page) {
 async function loginIfNeeded(page) {
   if (await isLoggedIn(page)) return true;
 
-  if (ERANK_COOKIES) { // primer empujón
+  if (ERANK_COOKIES) {
     await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(()=>{});
     await jitter();
     if (await isLoggedIn(page)) { await saveStorage(); return true; }
@@ -148,19 +148,17 @@ async function loginIfNeeded(page) {
 
   await openAndEnsure(page, `${BASE}/login`, `${BASE}/dashboard`);
 
-  // 1) Intento API (con CSRF si hay)
   try {
     await page.evaluate(async (email, pass) => {
       const token = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '';
-      const hdrs  = { 'Content-Type': 'application/json' };
-      if (token) hdrs['X-CSRF-TOKEN'] = token;
-      await fetch('/login', { method: 'POST', headers: hdrs, body: JSON.stringify({ email, password: pass }) });
+      const headers = { 'Content-Type': 'application/json' };
+      if (token) headers['X-CSRF-TOKEN'] = token;
+      await fetch('/login', { method: 'POST', headers, body: JSON.stringify({ email, password: pass }) });
     }, ERANK_EMAIL, ERANK_PASSWORD);
     await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(()=>{});
     await jitter();
   } catch {}
 
-  // 2) Fallback UI
   if (!(await isLoggedIn(page))) {
     try {
       await page.getByLabel(/email/i).fill(ERANK_EMAIL);
@@ -209,13 +207,12 @@ function extractSimpleTable($){
   const rows=[]; $('table tr').each((_,tr)=>{ const cells=[]; $(tr).find('th,td').each((__,td)=>cells.push($(td).text().trim().replace(/\s+/g,' '))); if(cells.length) rows.push(cells);}); return rows;
 }
 function extractChips($){ return $('[class*="chip"], [class*="tag"], .badge, .label').map((_,el)=>$(el).text().trim()).get().filter(Boolean); }
-function getInertiaPageJSON($){ const node=$('[data-page]').first(); if(!node.length) return null; const raw=node.attr('data-page'); if(!raw) return null; try{ return JSON.parse(raw);}catch{return null;} }
-function deepFindArrays(obj,predicate,acc=[]){ if(!obj||typeof obj!=='object') return acc; if(Array.isArray(obj)&&obj.some(predicate)) acc.push(obj); for(const k of Object.keys(obj)) deepFindArrays(obj[k],predicate,acc); return acc; }
+function getInertiaPageJSON($){ const node=$('[data-page]').first(); if(!node.length) return null; const raw=node?.attribs?.['data-page']; if(!raw) return null; try{ return JSON.parse(raw);}catch{return null;} }
 function tableByHeaders($, headerMatchers = []) {
   const tables=[];
-  $('table').each((_,t)=>{ const $t=$(t); const header=[]; $t.find('thead tr th, tr th').each((__,th)=>header.push($(th).text().trim().replace(/\s+/g,' ').toLowerCase())); if(!header.length) return;
+  $('table').each((_,t)=>{ const $t=$(t); const header=[]; $t.find('thead tr th, tr th').each((__,th)=>header.push($(th).text().trim().toLowerCase())); if(!header.length) return;
     const ok = headerMatchers.every(rx => header.some(h => rx.test(h))); if(!ok) return;
-    const rows=[]; $t.find('tbody tr, tr').each((i,tr)=>{ const tds=$(tr).find('td'); if(!tds.length) return; rows.push(tds.map((__,td)=>$(td).text().trim().replace(/\s+/g,' ')).get()); });
+    const rows=[]; $t.find('tbody tr, tr').each((i,tr)=>{ const tds=$(tr).find('td'); if(!tds.length) return; rows.push(tds.map((__,td)=>$(td).text().trim()).get()); });
     if(rows.length) tables.push({header,rows});
   });
   return tables[0] || null;
@@ -226,14 +223,14 @@ function parseKeywords(html){
   const $=cheerio.load(html);
   const tbl=tableByHeaders($,[/^keyword$/, /volume|avg.*search|searches/]);
   if(tbl){
-    const kIdx=tbl.header.findIndex(h=>/keyword/.test(h));
-    const vIdx=tbl.header.findIndex(h=>/(volume|avg.*search|searches)/.test(h));
-    const results=tbl.rows.map(r=>({keyword:(r[kIdx]||'').trim(), volume:(r[vIdx]||'').trim()})).filter(x=>x.keyword);
+    const k=tbl.header.findIndex(h=>/keyword/.test(h));
+    const v=tbl.header.findIndex(h=>/(volume|avg.*search|searches)/.test(h));
+    const results=tbl.rows.map(r=>({keyword:(r[k]||'').trim(), volume:(r[v]||'').trim()})).filter(x=>x.keyword);
     return {count:results.length, results, chips:extractChips($), ...htmlStats(html)};
   }
   const page=getInertiaPageJSON($);
   if(page){
-    const arrays=deepFindArrays(page,o=>o&&typeof o==='object'&&('keyword'in o||'term'in o));
+    const arrays=findArraysDeep(page,o=>o&&typeof o==='object'&&('keyword'in o||'term'in o));
     for(const arr of arrays){
       const results=arr.map(o=>({keyword:(o.keyword||o.term||'').toString(), volume:(o.volume||o.searches||o.avg_searches||'').toString()})).filter(x=>x.keyword);
       if(results.length) return {count:results.length, results, chips:extractChips($), ...htmlStats(html)};
@@ -244,12 +241,12 @@ function parseKeywords(html){
 }
 function parseTopListings(html){
   const $=cheerio.load(html); const items=[];
-  $('a[href*="/listing/"]').each((_,a)=>{ const href=$(a).attr('href')||''; const title=$(a).attr('title')||$(a).text().trim().replace(/\s+/g,' '); if(href||title) items.push({title,href}); });
-  $('[data-listing-id]').each((_,el)=>{ const id=$(el).attr('data-listing-id'); const title=$(el).text().trim().replace(/\s+/g,' '); if(id||title) items.push({listing_id:id, title}); });
+  $('a[href*="/listing/"]').each((_,a)=>{ const href=$(a).attr('href')||''; const title=$(a).attr('title')||$(a).text().trim(); if(href||title) items.push({title,href}); });
+  $('[data-listing-id]').each((_,el)=>{ const id=$(el).attr('data-listing-id'); const title=$(el).text().trim(); if(id||title) items.push({listing_id:id, title}); });
   if(items.length) return {count:items.length, results:items, ...htmlStats(html)};
   const page=getInertiaPageJSON($);
   if(page){
-    const arrays=deepFindArrays(page,o=>o&&typeof o==='object'&&('listing_id'in o||'title'in o));
+    const arrays=findArraysDeep(page,o=>o&&typeof o==='object'&&('listing_id'in o||'title'in o));
     for(const arr of arrays){
       const results=arr.map(o=>({listing_id:o.listing_id, title:(o.title||o.name||'').toString(), href:o.url||''})).filter(x=>x.title||x.href||x.listing_id);
       if(results.length) return {count:results.length, results, ...htmlStats(html)};
@@ -259,51 +256,82 @@ function parseTopListings(html){
 }
 function parseMyShop(html){
   const $=cheerio.load(html); const stats={};
-  $('[class*="stat"], [class*="metric"]').each((_,el)=>{ const t=$(el).text().trim().replace(/\s+/g,' '); if(t){ const parts=t.split(':'); if(parts.length>=2) stats[parts[0].trim()]=parts.slice(1).join(':').trim(); }});
+  $('[class*="stat"], [class*="metric"]').each((_,el)=>{ const t=$(el).text().trim(); if(t){ const a=t.split(':'); if(a.length>=2) stats[a[0].trim()]=a.slice(1).join(':').trim(); }});
   return {stats, ...htmlStats(html)};
 }
 function parseGenericList(html){
   const $=cheerio.load(html); const items=[];
   $('table').each((_,t)=>{ $(t).find('tr').each((i,tr)=>{ if(i===0&&$(tr).find('th').length) return; const tds=$(tr).find('td'); if(!tds.length) return;
-    const obj={}; tds.each((idx,td)=>{ obj[`col${idx+1}`]=$(td).text().trim().replace(/\s+/g,' '); });
-    if(Object.values(obj).some(v=>v)) items.push(obj);
+    const obj={}; tds.each((idx,td)=>{ obj[`col${idx+1}`]=$(td).text().trim(); }); if(Object.values(obj).some(v=>v)) items.push(obj);
   });});
-  if(!items.length){ $('[class*="card"], [class*="result"]').each((_,el)=>{ const text=cheerio.load(el).text().trim().replace(/\s+/g,' '); if(text) items.push({text}); }); }
+  if(!items.length){ $('[class*="card"], [class*="result"]').each((_,el)=>{ const text=cheerio.load(el).text().trim(); if(text) items.push({text}); }); }
   return {count:items.length, results:items, ...htmlStats(html)};
 }
 
 // ---------- Scraping/acciones en DOM ----------
-// NUEVA: usa el placeholder real y Enter; ignora inputs ocultos
-async function typeAndSearch(page, q) {
-  try {
-    console.log('[typeAndSearch] buscando input (placeholder exacto)');
-    const inputSelector = 'input[placeholder="Enter keywords, separated by comma"]';
-    await page.waitForSelector(inputSelector, { timeout: 20000 });
-    const input = await page.$(inputSelector);
-    if (!input) throw new Error('No visible input found');
-
-    await input.click({ clickCount: 3 }).catch(()=>{});
-    await input.fill('');
-    await input.type(q, { delay: 40 });
-
-    // Disparar reactividad
-    await page.evaluate((sel) => {
-      const el = document.querySelector(sel);
-      if (el) {
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
+async function scrapeKeywordsInPage(page){
+  return await page.evaluate(()=>{
+    const out=[];
+    const tables=[...document.querySelectorAll('table')];
+    for(const t of tables){
+      const headers=[...t.querySelectorAll('thead th, tr th')].map(th=>th.textContent.trim().toLowerCase());
+      if(!headers.length || !headers.some(h=>h.includes('keyword'))) continue;
+      const kIdx=headers.findIndex(h=>h.includes('keyword'));
+      const vIdx=headers.findIndex(h=>h.includes('search')||h.includes('volume'));
+      const rows=[...t.querySelectorAll('tbody tr, tr')];
+      for(const r of rows){
+        const cells=[...r.querySelectorAll('td')].map(td=>td.textContent.trim());
+        if(!cells.length) continue;
+        const kw=cells[kIdx]||''; const vol=vIdx>=0?(cells[vIdx]||''):'';
+        if(kw) out.push({keyword:kw, volume:vol});
       }
-    }, inputSelector);
-
-    // Enter para lanzar búsqueda
-    await input.press('Enter').catch(()=>{});
-    await page.waitForSelector('table tbody tr td, [data-listing-id], [data-keyword], .ant-empty', { timeout: 20000 }).catch(()=>{});
-    console.log('[typeAndSearch] done');
-  } catch (e) {
-    console.error('typeAndSearch failed:', e.message);
-  }
+    }
+    if(!out.length){
+      document.querySelectorAll('[data-keyword], .keyword, a[href*="/keyword/"]').forEach(el=>{
+        const kw=el.textContent.trim(); if(kw) out.push({keyword:kw});
+      });
+    }
+    return out;
+  });
+}
+async function scrapeTopListingsInPage(page){
+  return await page.evaluate(()=>{
+    const items=[];
+    document.querySelectorAll('a[href*="/listing/"]').forEach(a=>{
+      const href=a.getAttribute('href')||'';
+      const title=a.getAttribute('title')||a.textContent.trim();
+      if(href||title) items.push({title, href});
+    });
+    document.querySelectorAll('[data-listing-id]').forEach(el=>{
+      const id=el.getAttribute('data-listing-id');
+      const title=el.textContent.trim();
+      if(id||title) items.push({listing_id:id, title});
+    });
+    return items;
+  });
+}
+async function scrapeTagsInPage(page){
+  return await page.evaluate(()=>{
+    const tables=[...document.querySelectorAll('table')];
+    for(const t of tables){
+      const headers=[...t.querySelectorAll('thead th, tr th')].map(th=>th.textContent.trim().toLowerCase());
+      if(!headers.length) continue;
+      const hasTag=headers.some(h=>h==='tag');
+      const hasSearch=headers.some(h=>h.includes('search'));
+      if(!hasTag||!hasSearch) continue;
+      const idx={
+        tag: headers.findIndex(h=>h==='tag'),
+        avgS:headers.findIndex(h=>h.includes('search')),
+        avgC:headers.findIndex(h=>h.includes('click')),
+        ctr: headers findIndex?0:0
+      };
+      return []; // safety; real parsing done in server with cheerio
+    }
+    return [];
+  });
 }
 
+// ---------- Acciones de UI ----------
 async function ensureMarketplaceCountry(page, marketplace, country) {
   const mpBtn = page.getByRole('button', { name: /marketplace/i })
                     .or(page.getByRole('combobox').nth(0));
@@ -321,10 +349,37 @@ async function ensureMarketplaceCountry(page, marketplace, country) {
   }
 }
 
-async function autoScroll(page, steps = 6) {
+// Usa el placeholder exacto y Enter
+async function typeAndSearch(page, q) {
+  try {
+    const inputSelector = 'input[placeholder="Enter keywords, separated by comma"]';
+    await page.waitForSelector(inputSelector, { timeout: 20000 });
+    const input = await page.$(inputSelector);
+    if (!input) throw new Error('No visible input found');
+
+    await input.click({ clickCount: 3 }).catch(()=>{});
+    await input.fill('');
+    await input.type(q, { delay: 40 });
+
+    await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      if (el) {
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }, inputSelector);
+
+    await input.press('Enter').catch(()=>{});
+    await page.waitForSelector('table tbody tr td, [data-listing-id], [data-keyword], .ant-empty', { timeout: 20000 }).catch(()=>{});
+  } catch (e) {
+    console.error('typeAndSearch failed:', e.message);
+  }
+}
+
+async function autoScroll(page, steps = 3) {
   for (let i = 0; i < steps; i++) {
-    await page.evaluate(() => window.scrollBy(0, window.innerHeight));
-    await new Promise(r => setTimeout(r, 500));
+    await page.evaluate(() => window.scrollBy(0, window.innerHeight * 0.8));
+    await sleep(250);
   }
 }
 
@@ -353,6 +408,45 @@ async function captureJson(page, pred, timeMs = 3000) {
   return bucket;
 }
 
+// ---------- Normalizadores (MEJORA #4) ----------
+function normalizeValue(v) {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'number') return String(v);
+  if (typeof v === 'string') return v;
+  if (typeof v === 'object') {
+    const prefer = ['avg_searches', 'searches', 'volume', 'value', 'count', 'score', 'total', 'avg'];
+    for (const k of prefer) {
+      if (v[k] !== undefined && v[k] !== null) {
+        const x = v[k];
+        if (typeof x === 'number') return String(x);
+        if (typeof x === 'string') return x;
+      }
+    }
+    for (const [,x] of Object.entries(v)) {
+      if (typeof x === 'number') return String(x);
+      if (typeof x === 'string') return x;
+    }
+    try { return JSON.stringify(v); } catch { return String(v); }
+  }
+  return String(v);
+}
+function normalizeKeyword(obj) {
+  const kw = (obj?.keyword ?? obj?.term ?? obj?.query ?? '').toString().trim();
+  const vol = normalizeValue(obj?.volume ?? obj?.searches ?? obj?.avg_searches ?? obj?.metrics);
+  return kw ? { keyword: kw, volume: vol } : null;
+}
+function normalizeListing(obj) {
+  const base = obj || {};
+  let id    = base.listing_id ?? base.id ?? base?.listing?.id ?? base?.listing?.listing_id ?? '';
+  let title = (base.title ?? base.name ?? base?.listing?.title ?? base?.listing?.name ?? '').toString().trim();
+  let href  = (base.url ?? base.link ?? base.permalink ?? base?.listing?.url ?? base?.listing?.link ?? '').toString().trim();
+  if (!id && href) {
+    const m = href.match(/\/listing\/(\d+)/i);
+    if (m) id = m[1];
+  }
+  return (id || title || href) ? { listing_id: id, title, href } : null;
+}
+
 // ---------- Middlewares ----------
 app.use((req, _res, next) => { if (req.url.includes('//')) req.url = req.url.replace(/\/{2,}/g, '/'); next(); });
 app.use(async (_req, _res, next) => { await jitter(); next(); });
@@ -378,7 +472,7 @@ app.get('/erank/raw', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ---------- Endpoints: KEYWORDS ----------
+// ---------- Endpoints: KEYWORDS (MEJORA #3 + #4) ----------
 app.get('/erank/keywords', async (req, res) => {
   const q = (req.query.q || '').toString().trim();
   const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
@@ -395,24 +489,21 @@ app.get('/erank/keywords', async (req, res) => {
       await ensureMarketplaceCountry(page, marketplace, country);
       await typeAndSearch(page, q);
 
-      // Captura JSON mientras hidrata
       const cap = await captureJson(page, (x) => x && typeof x === 'object' && ('keyword' in x || 'term' in x), 2500);
 
-      await page.waitForTimeout(500);
+      await sleep(400);
       await autoScroll(page, 3);
 
       let results = [];
       for (const hit of cap) {
         for (const arr of hit.arrays) {
           for (const o of arr) {
-            const kw = (o.keyword || o.term || '').toString().trim();
-            const vol = (o.volume || o.searches || o.avg_searches || '').toString().trim();
-            if (kw) results.push({ keyword: kw, volume: vol });
+            const norm = normalizeKeyword(o);
+            if (norm) results.push(norm);
           }
         }
       }
 
-      // Fallback DOM/HTML
       if (!results.length) {
         await page.waitForSelector('table tbody tr td, [data-keyword]', { timeout: 4000 }).catch(()=>{});
         results = await scrapeKeywordsInPage(page);
@@ -454,7 +545,7 @@ app.get('/erank/near-matches', async (req, res) => {
   }
 });
 
-// ---------- Endpoints: TOP LISTINGS ----------
+// ---------- Endpoints: TOP LISTINGS (MEJORA #3 + #4) ----------
 app.get('/erank/top-listings', async (req, res) => {
   const q = (req.query.q || '').toString().trim();
   const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
@@ -471,7 +562,6 @@ app.get('/erank/top-listings', async (req, res) => {
       await ensureMarketplaceCountry(page, marketplace, country);
       await typeAndSearch(page, q);
 
-      // Abre pestaña TL
       const tab = page.getByRole('tab', { name: /top listings/i });
       if (await tab.isVisible().catch(()=>false)) {
         await tab.click().catch(()=>{}); await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(()=>{});
@@ -480,20 +570,17 @@ app.get('/erank/top-listings', async (req, res) => {
         await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(()=>{});
       }
 
-      // Captura JSON de listados
       const cap = await captureJson(page, (x) => x && typeof x === 'object' && ('listing_id' in x || 'title' in x || 'url' in x), 2500);
 
-      await page.waitForTimeout(500);
+      await sleep(400);
       await autoScroll(page, 3);
 
       let results = [];
       for (const hit of cap) {
         for (const arr of hit.arrays) {
           for (const o of arr) {
-            const title = (o.title || o.name || '').toString().trim();
-            const href  = (o.url || '').toString().trim();
-            const id    = o.listing_id;
-            if (title || href || id) results.push({ listing_id: id, title, href });
+            const norm = normalizeListing(o);
+            if (norm) results.push(norm);
           }
         }
       }
@@ -597,7 +684,7 @@ app.get('/debug/keywords-screenshot', async (req, res) => {
     await openAndEnsure(page, `${BASE}/keyword-tool`, `${BASE}/dashboard`);
     await ensureMarketplaceCountry(page, marketplace, country);
     await typeAndSearch(page, q);
-    await page.waitForTimeout(1500);
+    await sleep(1200);
     const buf = await page.screenshot({ fullPage: true });
     await page.close();
     res.set('content-type', 'image/png').send(buf);
@@ -605,7 +692,7 @@ app.get('/debug/keywords-screenshot', async (req, res) => {
 });
 
 app.get('/debug/toplist-screenshot', async (req, res) => {
-  const q = (req.query.q || '').toString().trim();
+  const q = (req.query q||'').toString().trim?.call ? (req.query.q||'').toString().trim() : (req.query.q||'');
   const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
   const marketplace = (req.query.marketplace || DEFAULT_MARKET).toLowerCase();
   if (!q) return res.status(400).json({ error: 'Falta ?q=' });
@@ -624,7 +711,7 @@ app.get('/debug/toplist-screenshot', async (req, res) => {
       await page.locator('text=Top Listings').first().click().catch(()=>{});
       await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(()=>{});
     }
-    await page.waitForTimeout(1200);
+    await sleep(1200);
     const buf = await page.screenshot({ fullPage: true });
     await page.close();
     res.set('content-type', 'image/png').send(buf);
