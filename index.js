@@ -136,7 +136,7 @@ async function isLoggedIn(page) {
 async function loginIfNeeded(page) {
   if (await isLoggedIn(page)) return true;
 
-  if (ERANK_COOKIES) { // primer empujón
+  if (ERANK_COOKIES) {
     await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(()=>{});
     await jitter();
     if (await isLoggedIn(page)) { await saveStorage(); return true; }
@@ -309,7 +309,7 @@ async function scrapeTopListingsInPage(page){
     return items;
   });
 }
-// ✅ FIX: versión correcta (sin typo) del parser DOM de Tags
+// DOM de Tags (sin typos)
 async function scrapeTagsInPage(page){
   return await page.evaluate(()=>{
     const out = [];
@@ -459,6 +459,8 @@ function normalizeListing(obj) {
     const m = href.match(/\/listing\/(\d+)/i);
     if (m) id = m[1];
   }
+  if (!href && id) href = `https://www.etsy.com/listing/${id}`;
+  if (!title) title = (base.shop_title ?? base.description ?? '').toString().trim();
   return (id || title || href) ? { listing_id: id, title, href } : null;
 }
 
@@ -487,7 +489,7 @@ app.get('/erank/raw', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ---------- Endpoints: KEYWORDS ----------
+// ---------- /erank/keywords ----------
 app.get('/erank/keywords', async (req, res) => {
   const q = (req.query.q || '').toString().trim();
   const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
@@ -504,19 +506,22 @@ app.get('/erank/keywords', async (req, res) => {
       await ensureMarketplaceCountry(page, marketplace, country);
       await typeAndSearch(page, q);
 
-      const cap = await captureJson(page, (x) => x && typeof x === 'object' && ('keyword' in x || 'term' in x), 2500);
+      // Espera explícita a un XHR relacionado
+      await page.waitForResponse(
+        r => /keyword|search|inertia/i.test(r.url()) && r.status() === 200,
+        { timeout: 5000 }
+      ).catch(() => {});
+
+      // Captura XHR (más tiempo)
+      const cap = await captureJson(page, (x) => x && typeof x === 'object' && ('keyword' in x || 'term' in x), 4000);
 
       await sleep(400);
       await autoScroll(page, 3);
 
       let results = [];
-      for (const hit of cap) {
-        for (const arr of hit.arrays) {
-          for (const o of arr) {
-            const norm = normalizeKeyword(o);
-            if (norm) results.push(norm);
-          }
-        }
+      for (const hit of cap) for (const arr of hit.arrays) for (const o of arr) {
+        const norm = normalizeKeyword(o);
+        if (norm) results.push(norm);
       }
 
       if (!results.length) {
@@ -537,7 +542,7 @@ app.get('/erank/keywords', async (req, res) => {
   }
 });
 
-// ---------- Endpoints: NEAR MATCHES ----------
+// ---------- /erank/near-matches ----------
 app.get('/erank/near-matches', async (req, res) => {
   const q = (req.query.q || '').toString().trim();
   const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
@@ -560,7 +565,7 @@ app.get('/erank/near-matches', async (req, res) => {
   }
 });
 
-// ---------- Endpoints: TOP LISTINGS ----------
+// ---------- /erank/top-listings ----------
 app.get('/erank/top-listings', async (req, res) => {
   const q = (req.query.q || '').toString().trim();
   const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
@@ -591,13 +596,9 @@ app.get('/erank/top-listings', async (req, res) => {
       await autoScroll(page, 3);
 
       let results = [];
-      for (const hit of cap) {
-        for (const arr of hit.arrays) {
-          for (const o of arr) {
-            const norm = normalizeListing(o);
-            if (norm) results.push(norm);
-          }
-        }
+      for (const hit of cap) for (const arr of hit.arrays) for (const o of arr) {
+        const norm = normalizeListing(o);
+        if (norm) results.push(norm);
       }
 
       if (!results.length) {
@@ -608,11 +609,87 @@ app.get('/erank/top-listings', async (req, res) => {
         }
       }
 
+      // Filtrar placeholders y duplicados
+      results = results
+        .filter(r => r && (r.listing_id || r.href))
+        .filter((r, i, a) => a.findIndex(x => (x.listing_id||'') === (r.listing_id||'') && (x.href||'') === (r.href||'')) === i);
+
       await page.close();
       return { query: q, country, marketplace, count: results.length, results };
     }, 'top-listings-ui');
     res.json(out);
   } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- /erank/tags (nuevo) ----------
+app.get('/erank/tags', async (req, res) => {
+  const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
+  const marketplace = (req.query.marketplace || DEFAULT_MARKET).toLowerCase();
+
+  try {
+    await ensureBrowser();
+    const page = await context.newPage();
+    await loginIfNeeded(page);
+
+    await openAndEnsure(page, `${BASE}/tags?country=${country}`, `${BASE}/dashboard`);
+    await page.waitForTimeout(600);
+    await autoScroll(page, 8);
+
+    // Captura XHR con objetos que tengan 'tag'
+    const cap = await captureJson(page, (x) => x && typeof x === 'object' && ('tag' in x), 2500);
+
+    // 1) Preferimos JSON si existe
+    let rows = [];
+    for (const hit of cap) for (const arr of hit.arrays) for (const o of arr) {
+      const tag = (o.tag || '').toString().trim();
+      if (!tag) continue;
+      rows.push({
+        tag,
+        avg_searches: (o.avg_searches ?? o.searches ?? '').toString(),
+        avg_clicks:   (o.avg_clicks   ?? '').toString(),
+        avg_ctr:      (o.avg_ctr      ?? o.ctr ?? '').toString(),
+        etsy_competition: (o.etsy_competition ?? o.competition ?? '').toString(),
+        search_trend: (o.trend ?? o.search_trend ?? '').toString()
+      });
+    }
+
+    // 2) DOM visible
+    if (!rows.length) {
+      rows = await scrapeTagsInPage(page);
+    }
+
+    // 3) Cheerio fallback
+    if (!rows.length) {
+      const html = await page.content();
+      const $ = cheerio.load(html);
+      const tbl = tableByHeaders($, [/^tag$/, /avg.*search|searches/, /clicks|ctr|click/]);
+      if (tbl) {
+        const idx = {
+          tag:  tbl.header.findIndex(h => /^tag$/.test(h)),
+          avgS: tbl.header.findIndex(h => /(avg.*search|searches)/.test(h)),
+          avgC: tbl.header.findIndex(h => /(avg.*click|clicks)/.test(h)),
+          ctr:  tbl.header.findIndex(h => /ctr/.test(h)),
+          comp: tbl.header.findIndex(h => /(competition|etsy)/.test(h)),
+          trend:tbl.header.findIndex(h => /(trend)/.test(h)),
+        };
+        rows = tbl.rows.map(r => ({
+          tag: r[idx.tag] || '',
+          avg_searches:     idx.avgS>=0 ? (r[idx.avgS] || '') : '',
+          avg_clicks:       idx.avgC>=0 ? (r[idx.avgC] || '') : '',
+          avg_ctr:          idx.ctr >=0 ? (r[idx.ctr ] || '') : '',
+          etsy_competition: idx.comp>=0 ? (r[idx.comp] || '') : '',
+          search_trend:     idx.trend>=0 ? (r[idx.trend]|| '') : ''
+        })).filter(x => x.tag);
+      }
+    }
+
+    await page.close();
+    res.json({ country, marketplace, count: rows.length, results: rows });
+
+  } catch (e) {
+    console.error('tags error:', e);
     res.status(500).json({ error: e.message });
   }
 });
