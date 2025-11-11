@@ -353,33 +353,60 @@ async function scrapeTagsInPage(page){
 
 // ---------- Acciones de UI ----------
 async function ensureMarketplaceCountry(page, marketplace, country) {
-  const mpBtn = page.getByRole('button', { name: /marketplace/i });
+  // Marketplace: botón o combobox alternativo
+  const mpBtn = page.getByRole('button', { name: /marketplace/i })
+                    .or(page.getByRole('combobox').nth(0));
   if (await mpBtn.isVisible().catch(() => false)) {
     await mpBtn.click().catch(()=>{});
-    await page.getByRole('option', { name: new RegExp(`^${marketplace}$`, 'i') }).click().catch(()=>{});
+    await page.getByRole('option', { name: new RegExp(`^${marketplace}$`, 'i') })
+              .click().catch(()=>{});
   }
-  const cBtn = page.getByRole('button', { name: /country/i });
+  // Country
+  const cBtn = page.getByRole('button', { name: /country/i })
+                   .or(page.getByRole('combobox').nth(1));
   if (await cBtn.isVisible().catch(() => false)) {
     await cBtn.click().catch(()=>{});
-    await page.getByRole('option', { name: new RegExp(`^${country}$`, 'i') }).click().catch(()=>{});
+    await page.getByRole('option', { name: new RegExp(`^${country}$`, 'i') })
+              .click().catch(()=>{});
   }
 }
+
 async function typeAndSearch(page, q) {
-  const kwInput = page.getByPlaceholder(/enter keywords?/i);
-  if (await kwInput.isVisible().catch(()=>false)) {
-    await kwInput.fill(q);
-    const searchBtn = page.getByRole('button', { name: /search/i });
-    if (await searchBtn.isVisible().catch(()=>false)) {
+  // Placeholder real + variantes
+  const input = page.locator('input[placeholder*="Enter keywords" i]');
+  await input.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
+  if (await input.isVisible().catch(()=>false)) {
+    await input.fill('');
+    await input.type(q, { delay: 35 });
+
+    // Disparar reactividad
+    await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }, 'input[placeholder*="Enter keywords" i]');
+
+    // Clic a la LUPA contigua al input (no siempre tiene name accesible)
+    const iconBtnNearInput = input.locator('xpath=..').locator('button').first();
+    if (await iconBtnNearInput.isVisible().catch(() => false)) {
       await Promise.all([
         page.waitForLoadState('networkidle', { timeout: 45000 }).catch(()=>{}),
-        searchBtn.click().catch(()=>{})
+        iconBtnNearInput.click().catch(()=>{})
       ]);
     } else {
-      await kwInput.press('Enter').catch(()=>{});
-      await page.waitForLoadState('networkidle', { timeout: 45000 }).catch(()=>{});
+      // Doble Enter fallback
+      await input.press('Enter').catch(()=>{});
+      await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(()=>{});
+      await input.press('Enter').catch(()=>{});
+      await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(()=>{});
     }
+
+    // Señal de resultados (tabla o cards)
+    await page.waitForSelector('table tbody tr td, a[href*="/listing/"], [data-listing-id]', { timeout: 15000 }).catch(()=>{});
   }
 }
+
 async function autoScroll(page, steps = 6) {
   for (let i = 0; i < steps; i++) {
     await page.evaluate(() => window.scrollBy(0, window.innerHeight));
@@ -413,7 +440,7 @@ app.get('/erank/keywords', async (req, res) => {
       await openAndEnsure(page, `${BASE}/keyword-tool`, `${BASE}/dashboard`);
       await ensureMarketplaceCountry(page, marketplace, country);
       await typeAndSearch(page, q);
-      await page.waitForSelector('table tbody tr td', { timeout: 12000 }).catch(()=>{});
+      await page.waitForSelector('table tbody tr td, a[href*="/listing/"], [data-listing-id]', { timeout: 12000 }).catch(()=>{});
 
       let results = await scrapeKeywordsInPage(page);
       if (!results.length) { const html = await page.content(); results = parseKeywords(html).results; }
@@ -459,7 +486,10 @@ app.get('/erank/top-listings', async (req, res) => {
       const tab = page.getByRole('tab', { name: /top listings/i });
       if (await tab.isVisible().catch(()=>false)) {
         await tab.click().catch(()=>{}); await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(()=>{});
-      } else { await page.locator('text=Top Listings').first().click().catch(()=>{}); await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(()=>{}); }
+      } else {
+        await page.locator('text=Top Listings').first().click().catch(()=>{});
+        await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(()=>{});
+      }
 
       let results = await scrapeTopListingsInPage(page);
       if (!results.length) { const html = await page.content(); results = parseTopListings(html).results; }
