@@ -1,5 +1,5 @@
 // index.js — eRank PRO scraper FINAL
-// Express + Playwright + Cheerio + Stealth + DOM UI Actions + Inertia/Tabla fallback + XHR capture + Normalizers
+// Express + Playwright + Cheerio + Stealth + DOM UI + XHR capture + Normalizers + Debug screenshots
 
 // ---------- Núcleo ----------
 const fs = require('fs');
@@ -8,7 +8,7 @@ const express = require('express');
 const cheerio = require('cheerio');
 const { chromium } = require('playwright');
 
-const app = new express.Router ? express() : require('express')(); // safe create
+const app = express();
 const port = process.env.PORT || 3000;
 
 // ---------- Constantes ----------
@@ -57,7 +57,7 @@ let consecutiveErrors = 0;
 // ---------- Utils ----------
 const rand   = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 const sleep  = (ms) => new Promise(r => setTimeout(r, ms));
-const pick   = (arr) => arr[Math.max(0, Math.min(arr.length - 1, Math.floor(Math.random() * arr.length)))];
+const pick   = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const jitter = async () => { if (STEALTH_ON) await sleep(rand(STEALTH_MIN_MS, STEALTH_MAX_MS)); };
 
 function cookiesFromString(cookieStr) {
@@ -93,7 +93,7 @@ async function ensureBrowser() {
   const contextOptions = {
     baseURL: BASE,
     userAgent: ua,
-    locale: lang.startsWith('e') ? lang : 'en-US',
+    locale: lang.startsWith('es') ? 'es-ES' : 'en-US',
     extraHTTPHeaders: { 'accept-language': lang, 'upgrade-insecure-requests': '1' }
   };
   if (fs.existsSync(STORAGE)) contextOptions.storageState = STORAGE;
@@ -105,8 +105,8 @@ async function ensureBrowser() {
     const parsed = cookiesFromString(ERANK_COOKIES);
     const both = [];
     for (const c of parsed) {
-      both.push({ ... c, domain: 'members.erank.com', sameSite: 'None' });
-      both.push({ ... c, domain: '.erank.com',        sameSite: 'None' });
+      both.push({ ...c, domain: 'members.erank.com', sameSite: 'None' });
+      both.push({ ...c, domain: '.erank.com',        sameSite: 'None' });
     }
     try { await context.addCookies(both); } catch (e) { console.error('addCookies:', e.message); }
   }
@@ -136,7 +136,7 @@ async function isLoggedIn(page) {
 async function loginIfNeeded(page) {
   if (await isLoggedIn(page)) return true;
 
-  if (ERANK_COOKIES) {
+  if (ERANK_COOKIES) { // primer empujón
     await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(()=>{});
     await jitter();
     if (await isLoggedIn(page)) { await saveStorage(); return true; }
@@ -148,17 +148,19 @@ async function loginIfNeeded(page) {
 
   await openAndEnsure(page, `${BASE}/login`, `${BASE}/dashboard`);
 
+  // 1) Intento API (con CSRF si hay)
   try {
     await page.evaluate(async (email, pass) => {
       const token = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '';
-      const headers = { 'Content-Type': 'application/json' };
-      if (token) headers['X-CSRF-TOKEN'] = token;
-      await fetch('/login', { method: 'POST', headers, body: JSON.stringify({ email, password: pass }) });
+      const hdrs  = { 'Content-Type': 'application/json' };
+      if (token) hdrs['X-CSRF-TOKEN'] = token;
+      await fetch('/login', { method: 'POST', headers: hdrs, body: JSON.stringify({ email, password: pass }) });
     }, ERANK_EMAIL, ERANK_PASSWORD);
     await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(()=>{});
     await jitter();
   } catch {}
 
+  // 2) Fallback UI
   if (!(await isLoggedIn(page))) {
     try {
       await page.getByLabel(/email/i).fill(ERANK_EMAIL);
@@ -203,11 +205,8 @@ async function withRetries(taskFn, label = 'task') {
 
 // ---------- Parsers helpers ----------
 function htmlStats(html){ return { htmlLength: html?.length || 0, totalKeywords: (html?.match(/keyword/gi) || []).length }; }
-function extractSimpleTable($){
-  const rows=[]; $('table tr').each((_,tr)=>{ const cells=[]; $(tr).find('th,td').each((__,td)=>cells.push($(td).text().trim().replace(/\s+/g,' '))); if(cells.length) rows.push(cells);}); return rows;
-}
 function extractChips($){ return $('[class*="chip"], [class*="tag"], .badge, .label').map((_,el)=>$(el).text().trim()).get().filter(Boolean); }
-function getInertiaPageJSON($){ const node=$('[data-page]').first(); if(!node.length) return null; const raw=node?.attribs?.['data-page']; if(!raw) return null; try{ return JSON.parse(raw);}catch{return null;} }
+function getInertiaPageJSON($){ const node=$('[data-page]').first(); if(!node.length) return null; const raw=node.attr('data-page'); if(!raw) return null; try{ return JSON.parse(raw);}catch{return null;} }
 function tableByHeaders($, headerMatchers = []) {
   const tables=[];
   $('table').each((_,t)=>{ const $t=$(t); const header=[]; $t.find('thead tr th, tr th').each((__,th)=>header.push($(th).text().trim().toLowerCase())); if(!header.length) return;
@@ -256,7 +255,7 @@ function parseTopListings(html){
 }
 function parseMyShop(html){
   const $=cheerio.load(html); const stats={};
-  $('[class*="stat"], [class*="metric"]').each((_,el)=>{ const t=$(el).text().trim(); if(t){ const a=t.split(':'); if(a.length>=2) stats[a[0].trim()]=a.slice(1).join(':').trim(); }});
+  $('[class*="stat"], [class*="metric"]').each((_,el)=>{ const t=$(el).text().trim().replace(/\s+/g,' '); if(t){ const a=t.split(':'); if(a.length>=2) stats[a[0].trim()]=a.slice(1).join(':').trim(); }});
   return {stats, ...htmlStats(html)};
 }
 function parseGenericList(html){
@@ -310,24 +309,40 @@ async function scrapeTopListingsInPage(page){
     return items;
   });
 }
+// ✅ FIX: versión correcta (sin typo) del parser DOM de Tags
 async function scrapeTagsInPage(page){
   return await page.evaluate(()=>{
-    const tables=[...document.querySelectorAll('table')];
-    for(const t of tables){
-      const headers=[...t.querySelectorAll('thead th, tr th')].map(th=>th.textContent.trim().toLowerCase());
-      if(!headers.length) continue;
-      const hasTag=headers.some(h=>h==='tag');
-      const hasSearch=headers.some(h=>h.includes('search'));
-      if(!hasTag||!hasSearch) continue;
-      const idx={
-        tag: headers.findIndex(h=>h==='tag'),
-        avgS:headers.findIndex(h=>h.includes('search')),
-        avgC:headers.findIndex(h=>h.includes('click')),
-        ctr: headers findIndex?0:0
+    const out = [];
+    const t = document.querySelector('table');
+    if (!t) return out;
+
+    const headers = Array.from(t.querySelectorAll('thead th, tr th'))
+      .map(th => th.textContent.trim().toLowerCase());
+
+    const idx = {
+      tag:  headers.findIndex(h => h === 'tag'),
+      avgS: headers.findIndex(h => h.includes('search')),
+      avgC: headers.findIndex(h => h.includes('click')),
+      ctr:  headers.findIndex(h => h.includes('ctr')),
+      comp: headers.findIndex(h => h.includes('competition') || h.includes('etsy')),
+      trend:headers.findIndex(h => h.includes('trend')),
+    };
+
+    Array.from(t.querySelectorAll('tbody tr, tr')).forEach(tr => {
+      const td = Array.from(tr.querySelectorAll('td')).map(td => td.textContent.trim());
+      if (!td.length) return;
+      const row = {
+        tag: (idx.tag  >= 0 ? td[idx.tag]  : '') || '',
+        avg_searches:     idx.avgS >= 0 ? (td[idx.avgS] || '') : '',
+        avg_clicks:       idx.avgC >= 0 ? (td[idx.avgC] || '') : '',
+        avg_ctr:          idx.ctr  >= 0 ? (td[idx.ctr ] || '') : '',
+        etsy_competition: idx.comp >= 0 ? (td[idx.comp] || '') : '',
+        search_trend:     idx.trend>= 0 ? (td[idx.trend]|| '') : ''
       };
-      return []; // safety; real parsing done in server with cheerio
-    }
-    return [];
+      if (row.tag) out.push(row);
+    });
+
+    return out;
   });
 }
 
@@ -408,7 +423,7 @@ async function captureJson(page, pred, timeMs = 3000) {
   return bucket;
 }
 
-// ---------- Normalizadores (MEJORA #4) ----------
+// ---------- Normalizadores ----------
 function normalizeValue(v) {
   if (v === null || v === undefined) return '';
   if (typeof v === 'number') return String(v);
@@ -451,7 +466,7 @@ function normalizeListing(obj) {
 app.use((req, _res, next) => { if (req.url.includes('//')) req.url = req.url.replace(/\/{2,}/g, '/'); next(); });
 app.use(async (_req, _res, next) => { await jitter(); next(); });
 
-// ---------- Health / Debug ----------
+// ---------- Health / Debug básicos ----------
 app.get('/healthz', (_req, res) => res.json({ ok: true, service: 'erank-scraper', stealth: STEALTH_ON }));
 app.get('/erank/healthz', (_req, res) => res.json({ ok: true, alias: 'erank/healthz', stealth: STEALTH_ON }));
 app.get('/debug/cookies', async (_req, res) => {
@@ -472,7 +487,7 @@ app.get('/erank/raw', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ---------- Endpoints: KEYWORDS (MEJORA #3 + #4) ----------
+// ---------- Endpoints: KEYWORDS ----------
 app.get('/erank/keywords', async (req, res) => {
   const q = (req.query.q || '').toString().trim();
   const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
@@ -545,7 +560,7 @@ app.get('/erank/near-matches', async (req, res) => {
   }
 });
 
-// ---------- Endpoints: TOP LISTINGS (MEJORA #3 + #4) ----------
+// ---------- Endpoints: TOP LISTINGS ----------
 app.get('/erank/top-listings', async (req, res) => {
   const q = (req.query.q || '').toString().trim();
   const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
@@ -692,7 +707,7 @@ app.get('/debug/keywords-screenshot', async (req, res) => {
 });
 
 app.get('/debug/toplist-screenshot', async (req, res) => {
-  const q = (req.query q||'').toString().trim?.call ? (req.query.q||'').toString().trim() : (req.query.q||'');
+  const q = (req.query.q || '').toString().trim();
   const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
   const marketplace = (req.query.marketplace || DEFAULT_MARKET).toLowerCase();
   if (!q) return res.status(400).json({ error: 'Falta ?q=' });
