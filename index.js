@@ -1,7 +1,5 @@
 // index.js — eRank PRO scraper FINAL
-// Express + Playwright + Cheerio + Stealth + Parsers DOM/Inertia/Tabla
-// ✔ Cookies PRO (Render ENV)  ✔ Retries/backoff  ✔ UA/locale rotativos
-// ✔ DOM scraping (page.evaluate)  ✔ Cheerio fallback  ✔ Context recycle
+// Express + Playwright + Cheerio + Stealth + DOM UI Actions + Inertia/Tabla fallback
 
 // ---------- Núcleo ----------
 const fs = require('fs');
@@ -274,7 +272,7 @@ function parseGenericList(html){
   return {count:items.length, results:items, ...htmlStats(html)};
 }
 
-// ---------- Scraping en DOM (page.evaluate) ----------
+// ---------- Scraping/acciones en DOM (page.evaluate) ----------
 async function scrapeKeywordsInPage(page){
   return await page.evaluate(()=>{
     const out=[];
@@ -353,14 +351,45 @@ async function scrapeTagsInPage(page){
   });
 }
 
+// ---------- Acciones de UI ----------
+async function ensureMarketplaceCountry(page, marketplace, country) {
+  const mpBtn = page.getByRole('button', { name: /marketplace/i });
+  if (await mpBtn.isVisible().catch(() => false)) {
+    await mpBtn.click().catch(()=>{});
+    await page.getByRole('option', { name: new RegExp(`^${marketplace}$`, 'i') }).click().catch(()=>{});
+  }
+  const cBtn = page.getByRole('button', { name: /country/i });
+  if (await cBtn.isVisible().catch(() => false)) {
+    await cBtn.click().catch(()=>{});
+    await page.getByRole('option', { name: new RegExp(`^${country}$`, 'i') }).click().catch(()=>{});
+  }
+}
+async function typeAndSearch(page, q) {
+  const kwInput = page.getByPlaceholder(/enter keywords?/i);
+  if (await kwInput.isVisible().catch(()=>false)) {
+    await kwInput.fill(q);
+    const searchBtn = page.getByRole('button', { name: /search/i });
+    if (await searchBtn.isVisible().catch(()=>false)) {
+      await Promise.all([
+        page.waitForLoadState('networkidle', { timeout: 45000 }).catch(()=>{}),
+        searchBtn.click().catch(()=>{})
+      ]);
+    } else {
+      await kwInput.press('Enter').catch(()=>{});
+      await page.waitForLoadState('networkidle', { timeout: 45000 }).catch(()=>{});
+    }
+  }
+}
+async function autoScroll(page, steps = 6) {
+  for (let i = 0; i < steps; i++) {
+    await page.evaluate(() => window.scrollBy(0, window.innerHeight));
+    await new Promise(r => setTimeout(r, 500));
+  }
+}
+
 // ---------- Middlewares ----------
-app.use((req, _res, next) => { // normaliza // temprano
-  if (req.url.includes('//')) req.url = req.url.replace(/\/{2,}/g, '/');
-  next();
-});
-app.use(async (_req, _res, next) => { // jitter global
-  await jitter(); next();
-});
+app.use((req, _res, next) => { if (req.url.includes('//')) req.url = req.url.replace(/\/{2,}/g, '/'); next(); });
+app.use(async (_req, _res, next) => { await jitter(); next(); });
 
 // ---------- Health / Debug ----------
 app.get('/healthz', (_req, res) => res.json({ ok: true, service: 'erank-scraper', stealth: STEALTH_ON }));
@@ -381,15 +410,17 @@ app.get('/erank/keywords', async (req, res) => {
   try {
     const out = await withRetries(async () => {
       await ensureBrowser(); const page = await context.newPage(); await loginIfNeeded(page);
-      const url = `${BASE}/keyword-tool?q=${encodeURIComponent(q)}&country=${country}&marketplace=${marketplace}`;
-      await openAndEnsure(page, url, `${BASE}/dashboard`);
+      await openAndEnsure(page, `${BASE}/keyword-tool`, `${BASE}/dashboard`);
+      await ensureMarketplaceCountry(page, marketplace, country);
+      await typeAndSearch(page, q);
+      await page.waitForSelector('table tbody tr td', { timeout: 12000 }).catch(()=>{});
 
       let results = await scrapeKeywordsInPage(page);
       if (!results.length) { const html = await page.content(); results = parseKeywords(html).results; }
 
       await page.close();
       return { query: q, country, marketplace, count: results.length, results };
-    }, 'keywords');
+    }, 'keywords-ui');
     res.json(out);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -421,19 +452,21 @@ app.get('/erank/top-listings', async (req, res) => {
   try {
     const out = await withRetries(async () => {
       await ensureBrowser(); const page = await context.newPage(); await loginIfNeeded(page);
-      const url = `${BASE}/keyword-tool?q=${encodeURIComponent(q)}&country=${country}&marketplace=${marketplace}`;
-      await openAndEnsure(page, url, `${BASE}/dashboard`);
+      await openAndEnsure(page, `${BASE}/keyword-tool`, `${BASE}/dashboard`);
+      await ensureMarketplaceCountry(page, marketplace, country);
+      await typeAndSearch(page, q);
+
       const tab = page.getByRole('tab', { name: /top listings/i });
       if (await tab.isVisible().catch(()=>false)) {
-        await tab.click().catch(()=>{}); await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(()=>{}); await sleep(600);
-      } else { await page.locator('text=Top Listings').first().click().catch(()=>{}); await sleep(600); }
+        await tab.click().catch(()=>{}); await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(()=>{});
+      } else { await page.locator('text=Top Listings').first().click().catch(()=>{}); await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(()=>{}); }
 
       let results = await scrapeTopListingsInPage(page);
       if (!results.length) { const html = await page.content(); results = parseTopListings(html).results; }
 
       await page.close();
       return { query: q, country, marketplace, count: results.length, results };
-    }, 'top-listings');
+    }, 'top-listings-ui');
     res.json(out);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -535,11 +568,14 @@ app.get('/erank/listings', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Tags con acciones de UI (scroll) + fallback
 app.get('/erank/tags', async (req, res) => {
   const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
   try {
     await ensureBrowser(); const page = await context.newPage(); await loginIfNeeded(page);
     await openAndEnsure(page, `${BASE}/tags?country=${country}`, `${BASE}/dashboard`);
+
+    await autoScroll(page, 8); // fuerza hidratación
 
     let rows = await scrapeTagsInPage(page);
     if (!rows.length) {
@@ -561,29 +597,14 @@ app.get('/erank/tags', async (req, res) => {
           avg_clicks:       idx.avgC>=0 ? (r[idx.avgC] || '') : '',
           avg_ctr:          idx.ctr >=0 ? (r[idx.ctr ] || '') : '',
           etsy_competition: idx.comp>=0 ? (r[idx.comp] || '') : '',
-          search_trend:     idx.trend>=0? (r[idx.trend]|| '') : ''
+          search_trend:     idx.trend>= 0? (r[idx.trend]|| '') : ''
         })).filter(x => x.tag);
-      } else {
-        const pageJson = getInertiaPageJSON($);
-        if (pageJson) {
-          const arrays = deepFindArrays(pageJson, o => o && typeof o === 'object' && ('tag' in o));
-          for (const arr of arrays) {
-            rows = arr.map(o => ({
-              tag: (o.tag || '').toString(),
-              avg_searches: (o.avg_searches || o.searches || '').toString(),
-              avg_clicks: (o.avg_clicks || '').toString(),
-              avg_ctr: (o.avg_ctr || o.ctr || '').toString(),
-              etsy_competition: (o.etsy_competition || o.competition || '').toString(),
-              search_trend: (o.trend || o.search_trend || '').toString()
-            })).filter(x => x.tag);
-            if (rows.length) break;
-          }
-        }
       }
     }
+
     await page.close();
     res.json({ country, count: rows.length, results: rows });
-  } catch (e) { console.error('tags error:', e); res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/erank/trend-buzz', async (req, res) => {
