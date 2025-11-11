@@ -20,9 +20,11 @@ let lastLoginAt = 0;
 const normCountry = (c) => {
   const s = String(c || "US").toUpperCase();
   if (s === "USA") return "US";
-  return s;
+  return s; // admite US / EU / etc.
 };
 const normSource = (m) => String(m || "etsy").toLowerCase();
+const text = (v) => (v ?? "").toString().trim();
+const safeArray = (v) => Array.isArray(v) ? v : [];
 
 // ---------- 1) LOGIN SANCTUM ----------
 async function ensureContextLogged(force = false) {
@@ -66,10 +68,10 @@ async function loadKeywordToolHTML(keyword, country, source) {
   const context = await ensureContextLogged();
   const page = await context.newPage();
 
+  // primero carga rápida para que Inertia pueble props
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 180000 });
 
-  // Espera escalonada: primero props Inertia en #app[data-page], luego tabla/chips
-  // 1) Esperar a que aparezca #app[data-page] con JSON válido
+  // Espera escalonada: #app[data-page] (Inertia) o al menos tabla/chips del DOM
   let dataPageJSON = null;
   try {
     await page.waitForSelector('#app[data-page]', { timeout: 8000 });
@@ -79,7 +81,6 @@ async function loadKeywordToolHTML(keyword, country, source) {
     });
   } catch (_) {}
 
-  // 2) Si no hay props con datos útiles, esperar a que al menos se renderice una fila/etiqueta
   if (!dataPageJSON) {
     try {
       await page.waitForSelector('table tbody tr, [class*=chip], [class*=tag], [data-testid*=keyword]', { timeout: 12000 });
@@ -92,16 +93,12 @@ async function loadKeywordToolHTML(keyword, country, source) {
 }
 
 // ---------- 3) PARSERS ROBUSTOS ----------
-function safeArray(v) { return Array.isArray(v) ? v : []; }
-function text(v) { return (v ?? "").toString().trim(); }
-
 function parseInertiaProps(jsonStr) {
   if (!jsonStr) return {};
   try { return JSON.parse(jsonStr) || {}; } catch { return {}; }
 }
 
 function pickKeywordsFromProps(propsRoot) {
-  // Busca arrays de objetos con {keyword|name|title}
   const out = [];
   const scan = (obj) => {
     if (!obj || typeof obj !== "object") return;
@@ -230,7 +227,7 @@ app.get("/erank/top-listings", async (req, res) => {
 
     if (!items.length) items = pickListingsFromHTML(html);
 
-    // dedup por url
+    // dedup por url/título
     const seen = new Set();
     items = items.filter(it => {
       const key = (it.url || it.title || "").toLowerCase();
