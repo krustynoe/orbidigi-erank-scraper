@@ -1,6 +1,8 @@
-// index.js — eRank PRO scraper FINAL + STEALTH
+// index.js — eRank PRO scraper FINAL + STEALTH + Parsers Inertia/Tabla
 // Playwright 1.56.1, Express, Cheerio. Pensado para Render (Docker).
-// Modo sigiloso: delays aleatorios, UA/locale rotativos, backoff/retry, referers, reciclado de contexto.
+// - Stealth: delays aleatorios, UA/locale rotativos, backoff/retry, referers, reciclado de contexto.
+// - Cookies PRO: ERANK_COOKIES → miembros (PRO) de eRank.
+// - Parsers robustos: tabla por encabezados + Inertia JSON (data-page).
 
 const fs = require('fs');
 const path = require('path');
@@ -26,10 +28,10 @@ const ERANK_PASSWORD= (process.env.ERANK_PASSWORD|| '').trim();
 
 // Stealth settings (configurables por ENV)
 const STEALTH_ON     = (process.env.STEALTH_ON || '1') !== '0';
-const STEALTH_MIN_MS = parseInt(process.env.STEALTH_MIN_MS || '700', 10);  // delay mínimo entre pasos
-const STEALTH_MAX_MS = parseInt(process.env.STEALTH_MAX_MS || '1600', 10); // delay máximo entre pasos
-const MAX_RETRIES    = parseInt(process.env.MAX_RETRIES    || '3', 10);    // reintentos por endpoint
-const RECYCLE_AFTER  = parseInt(process.env.RECYCLE_AFTER  || '6', 10);    // recicla contexto tras N fallos
+const STEALTH_MIN_MS = parseInt(process.env.STEALTH_MIN_MS || '700', 10);   // delay mínimo
+const STEALTH_MAX_MS = parseInt(process.env.STEALTH_MAX_MS || '1600', 10);  // delay máximo
+const MAX_RETRIES    = parseInt(process.env.MAX_RETRIES    || '3', 10);     // reintentos por endpoint
+const RECYCLE_AFTER  = parseInt(process.env.RECYCLE_AFTER  || '6', 10);     // recicla contexto tras N fallos
 
 // UAs y locales rotativos (para mitigar fingerprints)
 const USER_AGENTS = [
@@ -96,8 +98,8 @@ async function ensureBrowser() {
     args: ['--no-sandbox', '--disable-dev-shm-usage']
   });
 
-  const ua      = pick(USER_AGENTS);
-  const lang    = pick(ACCEPT_LANGS);
+  const ua   = pick(USER_AGENTS);
+  const lang = pick(ACCEPT_LANGS);
 
   const contextOptions = {
     baseURL: BASE,
@@ -223,7 +225,7 @@ async function withRetries(taskFn, label = 'task') {
   throw lastErr;
 }
 
-// ---------- Parsers ----------
+// ---------- Parsers helpers (NUEVOS) ----------
 function htmlStats(html) {
   return {
     htmlLength: html?.length || 0,
@@ -247,33 +249,119 @@ function extractChips($) {
     .get()
     .filter(Boolean);
 }
+function getInertiaPageJSON($) {
+  const node = $('[data-page]').first();
+  if (!node.length) return null;
+  const raw = node.attr('data-page');
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+function deepFindArrays(obj, predicate, acc = []) {
+  if (!obj || typeof obj !== 'object') return acc;
+  if (Array.isArray(obj) && obj.some(predicate)) acc.push(obj);
+  for (const k of Object.keys(obj)) deepFindArrays(obj[k], predicate, acc);
+  return acc;
+}
+function tableByHeaders($, headerMatchers = []) {
+  const tables = [];
+  $('table').each((_, t) => {
+    const $t = $(t);
+    const header = [];
+    $t.find('thead tr th, tr th').each((__, th) =>
+      header.push($(th).text().trim().replace(/\s+/g, ' ').toLowerCase())
+    );
+    if (!header.length) return;
+    const ok = headerMatchers.every(rx => header.some(h => rx.test(h)));
+    if (!ok) return;
+    const rows = [];
+    $t.find('tbody tr, tr').each((i, tr) => {
+      const tds = $(tr).find('td');
+      if (!tds.length) return;
+      rows.push(tds.map((__, td) => $(td).text().trim().replace(/\s+/g, ' ')).get());
+    });
+    if (rows.length) tables.push({ header, rows });
+  });
+  return tables[0] || null;
+}
+
+// ---------- Parsers principales (ACTUALIZADOS) ----------
 function parseKeywords(html) {
   const $ = cheerio.load(html);
-  const table = extractSimpleTable($);
-  const chips = extractChips($);
-  const results = [];
-  if (table.length > 1) {
-    const body = table[0].length > 1 ? table.slice(1) : table;
-    for (const row of body) {
-      const keyword = row[0] || '';
-      const volume  = row[1] || '';
-      if (keyword) results.push({ keyword, volume });
-    }
-  } else {
-    $('*[data-keyword]').each((_, el) => results.push({ keyword: $(el).text().trim() }));
+
+  // 1) Tabla con encabezados "keyword" y "volume/searches"
+  const tbl = tableByHeaders($, [/^keyword$/, /volume|avg.*search|searches/]);
+  if (tbl) {
+    const kIdx = tbl.header.findIndex(h => /keyword/.test(h));
+    const vIdx = tbl.header.findIndex(h => /(volume|avg.*search|searches)/.test(h));
+    const results = tbl.rows
+      .map(r => ({ keyword: (r[kIdx] || '').trim(), volume: (r[vIdx] || '').trim() }))
+      .filter(x => x.keyword);
+    return { count: results.length, results, chips: extractChips($), ...htmlStats(html) };
   }
-  return { count: results.length, results, chips, ...htmlStats(html) };
+
+  // 2) Inertia JSON
+  const page = getInertiaPageJSON($);
+  if (page) {
+    const arrays = deepFindArrays(page, o => o && typeof o === 'object' && ('keyword' in o || 'term' in o));
+    for (const arr of arrays) {
+      const results = arr
+        .map(o => ({
+          keyword: (o.keyword || o.term || '').toString(),
+          volume:  (o.volume || o.searches || o.avg_searches || '').toString()
+        }))
+        .filter(x => x.keyword);
+      if (results.length) return { count: results.length, results, chips: extractChips($), ...htmlStats(html) };
+    }
+  }
+
+  // 3) Fallback: nodos sueltos
+  const results = [];
+  $('[data-keyword], .keyword, a[href*="/keyword/"]').each((_, el) => {
+    const kw = $(el).text().trim();
+    if (kw) results.push({ keyword: kw });
+  });
+  return { count: results.length, results, chips: extractChips($), ...htmlStats(html) };
 }
+
 function parseTopListings(html) {
   const $ = cheerio.load(html);
-  const cards = [];
-  $('[class*="listing"], [data-listing-id], a[href*="/listing/"]').each((_, el) => {
-    const title = $(el).text().trim().replace(/\s+/g, ' ');
-    const href  = $(el).attr('href') || '';
-    if (title || href) cards.push({ title, href });
+
+  // 1) Anchors a /listing/ con título
+  const items = [];
+  $('a[href*="/listing/"]').each((_, a) => {
+    const href = $(a).attr('href') || '';
+    const title = $(a).attr('title') || $(a).text().trim().replace(/\s+/g, ' ');
+    if (href || title) items.push({ title, href });
   });
-  return { count: cards.length, results: cards, ...htmlStats(html) };
+
+  // 2) Cards con data-listing-id
+  $('[data-listing-id]').each((_, el) => {
+    const id = $(el).attr('data-listing-id');
+    const title = $(el).text().trim().replace(/\s+/g, ' ');
+    if (id || title) items.push({ listing_id: id, title });
+  });
+
+  if (items.length) return { count: items.length, results: items, ...htmlStats(html) };
+
+  // 3) Inertia JSON
+  const page = getInertiaPageJSON($);
+  if (page) {
+    const arrays = deepFindArrays(page, o => o && typeof o === 'object' && ('listing_id' in o || 'title' in o));
+    for (const arr of arrays) {
+      const results = arr
+        .map(o => ({
+          listing_id: o.listing_id,
+          title: (o.title || o.name || '').toString(),
+          href: o.url || ''
+        }))
+        .filter(x => x.title || x.href || x.listing_id);
+      if (results.length) return { count: results.length, results, ...htmlStats(html) };
+    }
+  }
+
+  return { count: 0, results: [], ...htmlStats(html) };
 }
+
 function parseMyShop(html) {
   const $ = cheerio.load(html);
   const stats = {};
@@ -286,38 +374,40 @@ function parseMyShop(html) {
   });
   return { stats, ...htmlStats(html) };
 }
+
 function parseGenericList(html) {
   const $ = cheerio.load(html);
   const items = [];
-  $('table tr').each((i, tr) => {
-    if (i === 0) return;
-    const tds = $(tr).find('td');
-    if (tds.length) {
+  $('table').each((_, t) => {
+    $(t).find('tr').each((i, tr) => {
+      if (i === 0 && $(tr).find('th').length) return; // header
+      const tds = $(tr).find('td');
+      if (!tds.length) return;
       const obj = {};
       tds.each((idx, td) => { obj[`col${idx+1}`] = $(td).text().trim().replace(/\s+/g, ' '); });
-      items.push(obj);
-    }
+      if (Object.values(obj).some(v => v)) items.push(obj); // descarta filas vacías
+    });
   });
   if (!items.length) {
     $('[class*="card"], [class*="result"]').each((_, el) => {
-      items.push({ text: cheerio.load(el).text().trim().replace(/\s+/g, ' ') });
+      const text = cheerio.load(el).text().trim().replace(/\s+/g, ' ');
+      if (text) items.push({ text });
     });
   }
   return { count: items.length, results: items, ...htmlStats(html) };
 }
 
-// ---------- Middleware global: normaliza // y añade pequeño delay entre requests ----------
+// ---------- Middleware global ----------
 app.use(async (req, _res, next) => {
   if (req.url.includes('//')) req.url = req.url.replace(/\/{2,}/g, '/');
   await jitter();
   next();
 });
 
-// ---------- Health ----------
+// ---------- Health / Debug ----------
 app.get('/healthz', (_req, res) => res.json({ ok: true, service: 'erank-scraper', stealth: STEALTH_ON }));
 app.get('/erank/healthz', (_req, res) => res.json({ ok: true, alias: 'erank/healthz', stealth: STEALTH_ON }));
 
-// Debug cookies
 app.get('/debug/cookies', async (_req, res) => {
   try {
     await ensureBrowser();
@@ -383,7 +473,7 @@ app.get('/erank/top-listings', async (req, res) => {
       await loginIfNeeded(page);
       const url = `${BASE}/keyword-tool?q=${encodeURIComponent(q)}&country=${country}&marketplace=${marketplace}`;
       await openAndEnsure(page, url, `${BASE}/dashboard`);
-      // Clic robusto pestaña
+      // Clic robusto pestaña Top Listings
       const tab = page.getByRole('tab', { name: /top listings/i });
       if (await tab.isVisible().catch(()=>false)) {
         await tab.click().catch(()=>{});
@@ -489,7 +579,7 @@ app.get('/erank/raw', async (req, res) => {
   }
 });
 
-// --- Extras que pediste (tienda/estado/tags/trends) ---
+// --- Extras que necesitas (tienda/estado/tags/trends) ---
 app.get('/erank/shop-info', async (req, res) => {
   const shop = (req.query.shop || '').toString().trim();
   const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
@@ -540,35 +630,64 @@ app.get('/erank/listings', async (req, res) => {
   }
 });
 
+// NUEVO parser /erank/tags (tabla por encabezados + Inertia JSON)
 app.get('/erank/tags', async (req, res) => {
   const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
   try {
-    const out = await withRetries(async () => {
-      await ensureBrowser();
-      const page = await context.newPage();
-      await loginIfNeeded(page);
-      await openAndEnsure(page, `${BASE}/tags?country=${country}`, `${BASE}/dashboard`);
-      const html = await page.content();
-      const $ = cheerio.load(html);
-      const rows = [];
-      $('table tr').each((i, tr) => {
-        if (i === 0) return;
-        const td = $(tr).find('td');
-        if (!td.length) return;
-        rows.push({
-          tag: $(td[0]).text().trim(),
-          avg_searches:     $(td[2])?.text()?.trim() || '',
-          avg_clicks:       $(td[3])?.text()?.trim() || '',
-          avg_ctr:          $(td[4])?.text()?.trim() || '',
-          etsy_competition: $(td[5])?.text()?.trim() || '',
-          search_trend:     $(td[6])?.text()?.trim() || ''
-        });
-      });
-      await page.close();
-      return { country, count: rows.length, results: rows, ...htmlStats(html) };
-    }, 'tags');
-    res.json(out);
+    await ensureBrowser();
+    const page = await context.newPage();
+    await loginIfNeeded(page);
+    await openAndEnsure(page, `${BASE}/tags?country=${country}`, `${BASE}/dashboard`);
+    const html = await page.content();
+    await page.close();
+
+    const $ = cheerio.load(html);
+
+    // 1) Tabla con encabezados "tag", "avg searches", "ctr", "competition"
+    const tbl = tableByHeaders($, [/^tag$/, /avg.*search|searches/, /clicks|ctr|click/]);
+    if (tbl) {
+      const idx = {
+        tag:  tbl.header.findIndex(h => /^tag$/.test(h)),
+        avgS: tbl.header.findIndex(h => /(avg.*search|searches)/.test(h)),
+        avgC: tbl.header.findIndex(h => /(avg.*click|clicks)/.test(h)),
+        ctr:  tbl.header.findIndex(h => /ctr/.test(h)),
+        comp: tbl.header.findIndex(h => /(competition|etsy)/.test(h)),
+        trend:tbl.header.findIndex(h => /(trend)/.test(h)),
+      };
+      const results = tbl.rows.map(r => ({
+        tag: (r[idx.tag] || '').trim(),
+        avg_searches:     (idx.avgS >= 0 ? r[idx.avgS] : '') || '',
+        avg_clicks:       (idx.avgC >= 0 ? r[idx.avgC] : '') || '',
+        avg_ctr:          (idx.ctr  >= 0 ? r[idx.ctr ] : '') || '',
+        etsy_competition: (idx.comp >= 0 ? r[idx.comp] : '') || '',
+        search_trend:     (idx.trend>= 0 ? r[idx.trend]: '') || ''
+      })).filter(x => x.tag);
+      return res.json({ country, count: results.length, results, ...htmlStats(html) });
+    }
+
+    // 2) Inertia JSON fallback
+    const pageJson = getInertiaPageJSON($);
+    if (pageJson) {
+      const arrays = deepFindArrays(pageJson, o => o && typeof o === 'object' && ('tag' in o));
+      for (const arr of arrays) {
+        const results = arr
+          .map(o => ({
+            tag: (o.tag || '').toString(),
+            avg_searches: (o.avg_searches || o.searches || '').toString(),
+            avg_clicks: (o.avg_clicks || '').toString(),
+            avg_ctr: (o.avg_ctr || o.ctr || '').toString(),
+            etsy_competition: (o.etsy_competition || o.competition || '').toString(),
+            search_trend: (o.trend || o.search_trend || '').toString()
+          }))
+          .filter(x => x.tag);
+        if (results.length) return res.json({ country, count: results.length, results, ...htmlStats(html) });
+      }
+    }
+
+    // 3) Fallback vacío
+    return res.json({ country, count: 0, results: [], ...htmlStats(html) });
   } catch (e) {
+    console.error('tags error:', e);
     res.status(500).json({ error: e.message });
   }
 });
