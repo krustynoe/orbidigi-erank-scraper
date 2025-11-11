@@ -171,7 +171,9 @@ async function loginIfNeeded(page) {
         page.waitForNavigation({ url: /\/dashboard/, timeout: 45000 }),
         page.getByRole('button', { name: /log.?in|sign.?in/i }).click()
       ]);
-    } catch (e) { console.error('Login UI fallback:', e.message); }
+    } catch (e) {
+      console.error('Login UI fallback:', e.message);
+    }
   }
 
   if (!(await isLoggedIn(page))) {
@@ -191,7 +193,7 @@ async function withRetries(taskFn, label = 'task') {
       return out;
     } catch (e) {
       lastErr = e; consecutiveErrors++;
-      const delay = rand(700, 2000) * attempt;
+      const delay = rand(700, 2000) * attempt; // backoff suave
       console.warn(`[retry] ${label} attempt ${attempt}/${MAX_RETRIES} failed: ${e.message}. Waiting ${delay}ms`);
       await sleep(delay);
       if (consecutiveErrors >= RECYCLE_AFTER) {
@@ -272,7 +274,7 @@ function parseGenericList(html){
   return {count:items.length, results:items, ...htmlStats(html)};
 }
 
-// ---------- Scraping/acciones en DOM (page.evaluate) ----------
+// ---------- Scraping/acciones en DOM ----------
 async function scrapeKeywordsInPage(page){
   return await page.evaluate(()=>{
     const out=[];
@@ -353,7 +355,6 @@ async function scrapeTagsInPage(page){
 
 // ---------- Acciones de UI ----------
 async function ensureMarketplaceCountry(page, marketplace, country) {
-  // Marketplace: botón o combobox alternativo
   const mpBtn = page.getByRole('button', { name: /marketplace/i })
                     .or(page.getByRole('combobox').nth(0));
   if (await mpBtn.isVisible().catch(() => false)) {
@@ -361,7 +362,6 @@ async function ensureMarketplaceCountry(page, marketplace, country) {
     await page.getByRole('option', { name: new RegExp(`^${marketplace}$`, 'i') })
               .click().catch(()=>{});
   }
-  // Country
   const cBtn = page.getByRole('button', { name: /country/i })
                    .or(page.getByRole('combobox').nth(1));
   if (await cBtn.isVisible().catch(() => false)) {
@@ -371,39 +371,42 @@ async function ensureMarketplaceCountry(page, marketplace, country) {
   }
 }
 
+// ⭐ NUEVA: dispara la búsqueda real en eRank (React input + lupa)
 async function typeAndSearch(page, q) {
-  // Placeholder real + variantes
-  const input = page.locator('input[placeholder*="Enter keywords" i]');
-  await input.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
-  if (await input.isVisible().catch(()=>false)) {
-    await input.fill('');
-    await input.type(q, { delay: 35 });
+  try {
+    const inputSelector = 'input.react-autosuggest__input, .react-autosuggest__container input, input[type="text"]';
+    await page.waitForSelector(inputSelector, { timeout: 15000 });
+    const input = await page.$(inputSelector);
 
-    // Disparar reactividad
+    // limpiar y escribir
+    await input.click({ clickCount: 3 });
+    await input.press('Backspace');
+    await input.type(q, { delay: 40 });
+
+    // eventos para frameworks reactivos
     await page.evaluate((sel) => {
       const el = document.querySelector(sel);
-      if (!el) return;
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-    }, 'input[placeholder*="Enter keywords" i]');
+      if (el) {
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }, inputSelector);
 
-    // Clic a la LUPA contigua al input (no siempre tiene name accesible)
-    const iconBtnNearInput = input.locator('xpath=..').locator('button').first();
-    if (await iconBtnNearInput.isVisible().catch(() => false)) {
-      await Promise.all([
-        page.waitForLoadState('networkidle', { timeout: 45000 }).catch(()=>{}),
-        iconBtnNearInput.click().catch(()=>{})
-      ]);
+    // intentar click en la lupa
+    const searchBtnSelector = 'button svg[data-icon="search"], button svg.svg-inline--fa';
+    const icon = await page.$(searchBtnSelector);
+    if (icon) {
+      const buttonParent = await icon.evaluateHandle(el => el.closest('button'));
+      await buttonParent.click();
     } else {
-      // Doble Enter fallback
-      await input.press('Enter').catch(()=>{});
-      await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(()=>{});
-      await input.press('Enter').catch(()=>{});
-      await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(()=>{});
+      // fallback Enter
+      await input.press('Enter');
     }
 
-    // Señal de resultados (tabla o cards)
-    await page.waitForSelector('table tbody tr td, a[href*="/listing/"], [data-listing-id]', { timeout: 15000 }).catch(()=>{});
+    // esperar cualquier señal de resultados
+    await page.waitForSelector('table tbody tr td, [data-listing-id], [data-keyword]', { timeout: 20000 }).catch(()=>{});
+  } catch (e) {
+    console.error('typeAndSearch failed:', e.message);
   }
 }
 
@@ -426,6 +429,18 @@ app.get('/debug/cookies', async (_req, res) => {
     res.json({ count: ck.length, cookies: ck.map(c => ({ name: c.name, domain: c.domain })) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+app.get('/erank/raw', async (req, res) => {
+  const p = (req.query.path || '/dashboard').toString();
+  try {
+    await ensureBrowser();
+    const page = await context.newPage();
+    await loginIfNeeded(page);
+    await openAndEnsure(page, `${BASE}${p.startsWith('/') ? '' : '/'}${p}`, pick(REFERERS));
+    const html = await page.content();
+    await page.close();
+    res.set('content-type', 'text/html; charset=utf-8').send(html);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // ---------- Endpoints ----------
 app.get('/erank/keywords', async (req, res) => {
@@ -440,11 +455,9 @@ app.get('/erank/keywords', async (req, res) => {
       await openAndEnsure(page, `${BASE}/keyword-tool`, `${BASE}/dashboard`);
       await ensureMarketplaceCountry(page, marketplace, country);
       await typeAndSearch(page, q);
-      await page.waitForSelector('table tbody tr td, a[href*="/listing/"], [data-listing-id]', { timeout: 12000 }).catch(()=>{});
-
+      // DOM vivo primero
       let results = await scrapeKeywordsInPage(page);
       if (!results.length) { const html = await page.content(); results = parseKeywords(html).results; }
-
       await page.close();
       return { query: q, country, marketplace, count: results.length, results };
     }, 'keywords-ui');
@@ -549,55 +562,6 @@ app.get('/erank/competitors', async (_req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/erank/raw', async (req, res) => {
-  const p = (req.query.path || '/dashboard').toString();
-  try {
-    const html = await withRetries(async () => {
-      await ensureBrowser(); const page = await context.newPage(); await loginIfNeeded(page);
-      await openAndEnsure(page, `${BASE}${p.startsWith('/') ? '' : '/'}${p}`, pick(REFERERS));
-      const html = await page.content(); await page.close(); return html;
-    }, 'raw');
-    res.set('content-type', 'text/html; charset=utf-8').send(html);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// --- Extras (tienda/estado/tags/trends) ---
-app.get('/erank/shop-info', async (req, res) => {
-  const shop = (req.query.shop || '').toString().trim();
-  const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
-  const marketplace = (req.query.marketplace || DEFAULT_MARKET).toLowerCase();
-  if (!shop) return res.status(400).json({ error: 'Falta ?shop=' });
-
-  try {
-    const out = await withRetries(async () => {
-      await ensureBrowser(); const page = await context.newPage(); await loginIfNeeded(page);
-      await openAndEnsure(page, `${BASE}/shop-info?country=${country}&marketplace=${marketplace}`, `${BASE}/dashboard`);
-      await page.getByPlaceholder(/enter shop name/i).fill(shop).catch(()=>{}); await jitter();
-      const btn = page.getByRole('button', { name: /^find$/i });
-      if (await btn.isVisible().catch(()=>false)) {
-        await Promise.all([ page.waitForLoadState('networkidle', { timeout: 45000 }), btn.click() ]); await jitter();
-      }
-      const html = await page.content(); await page.close();
-      return { shop, country, marketplace, ...parseGenericList(html) };
-    }, 'shop-info');
-    res.json(out);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/erank/listings', async (req, res) => {
-  const status = (req.query.status || 'active').toString().toLowerCase();
-  const seg = { active: 'active', draft: 'draft', expired: 'expired' }[status] || 'active';
-  try {
-    const out = await withRetries(async () => {
-      await ensureBrowser(); const page = await context.newPage(); await loginIfNeeded(page);
-      await openAndEnsure(page, `${BASE}/listings/${seg}`, `${BASE}/dashboard`);
-      const html = await page.content(); await page.close();
-      return { status: seg, ...parseGenericList(html) };
-    }, 'listings');
-    res.json(out);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 // Tags con acciones de UI (scroll) + fallback
 app.get('/erank/tags', async (req, res) => {
   const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
@@ -658,6 +622,43 @@ app.get('/erank/trend-buzz', async (req, res) => {
       const html = await page.content(); await page.close();
       return { marketplace, country, tab, ...parseGenericList(html) };
     }, 'trend-buzz');
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Extras
+app.get('/erank/shop-info', async (req, res) => {
+  const shop = (req.query.shop || '').toString().trim();
+  const country = (req.query.country || DEFAULT_COUNTRY).toUpperCase();
+  const marketplace = (req.query.marketplace || DEFAULT_MARKET).toLowerCase();
+  if (!shop) return res.status(400).json({ error: 'Falta ?shop=' });
+
+  try {
+    const out = await withRetries(async () => {
+      await ensureBrowser(); const page = await context.newPage(); await loginIfNeeded(page);
+      await openAndEnsure(page, `${BASE}/shop-info?country=${country}&marketplace=${marketplace}`, `${BASE}/dashboard`);
+      await page.getByPlaceholder(/enter shop name/i).fill(shop).catch(()=>{}); await jitter();
+      const btn = page.getByRole('button', { name: /^find$/i });
+      if (await btn.isVisible().catch(()=>false)) {
+        await Promise.all([ page.waitForLoadState('networkidle', { timeout: 45000 }), btn.click() ]); await jitter();
+      }
+      const html = await page.content(); await page.close();
+      return { shop, country, marketplace, ...parseGenericList(html) };
+    }, 'shop-info');
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/erank/listings', async (req, res) => {
+  const status = (req.query.status || 'active').toString().toLowerCase();
+  const seg = { active: 'active', draft: 'draft', expired: 'expired' }[status] || 'active';
+  try {
+    const out = await withRetries(async () => {
+      await ensureBrowser(); const page = await context.newPage(); await loginIfNeeded(page);
+      await openAndEnsure(page, `${BASE}/listings/${seg}`, `${BASE}/dashboard`);
+      const html = await page.content(); await page.close();
+      return { status: seg, ...parseGenericList(html) };
+    }, 'listings');
     res.json(out);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
