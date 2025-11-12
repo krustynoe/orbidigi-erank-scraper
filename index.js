@@ -1,4 +1,4 @@
-// index.js — eRank PRO scraper FINAL (TopN + scoring + debug) — clean syntax
+// index.js — eRank PRO scraper FINAL (TopN + scoring + debug) — clean & robust (CJS)
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -89,11 +89,11 @@ async function ensureBrowser(){
     locale: lang.startsWith('es')?'es-ES':'en-US',
     extraHTTPHeaders: { 'accept-language': lang, 'upgrade-insecure-requests':'1' }
   };
-  // ✅ Parche: crear contexto correctamente (storageState si existe)
+  // ✅ usar storageState si existe
   if (fs.existsSync(STORAGE)) ctxOpts.storageState = STORAGE;
   context = await browser.newContext(ctxOpts);
 
-  // Cookies PRO
+  // Cookies PRO (dos dominios)
   if (ERANK_COOKIES){
     const cookies = ERANK_COOKIES.split(';').map(s=>s.trim()).filter(Boolean).map(pair=>{
       const i=pair.indexOf('='); if (i<=0) return null;
@@ -232,7 +232,6 @@ function normalizeListing(o){
 /* ===========================
    HTML FALLBACK PARSERS
 =========================== */
-function htmlStats(html){ return { htmlLength:(html?.length||0), totalKeywords:(html?.match(/keyword/gi)||[]).length }; }
 function tableByHeaders($, patterns){
   const tables=[];
   $('table').each((_,t)=>{
@@ -240,8 +239,7 @@ function tableByHeaders($, patterns){
     $t.find('thead th, tr th').each((__,th)=> hdr.push($(th).text().trim().toLowerCase()));
     if (!hdr.length) return;
     if (!patterns.every(rx=> hdr.some(h=>rx.test(h)))) return;
-    const rows=[];
-    $t.find('tbody tr').each((__,tr)=>{ const tds=$(tr).find('td'); if(!tds.length) return; rows.push(tds.map((__,td)=>$(td).text().trim()).get()); });
+    const rows=[]; $t.find('tbody tr').each((__,tr)=>{ const tds=$(tr).find('td'); if(!tds.length) return; rows.push(tds.map((__,td)=>$(td).text().trim()).get()); });
     if (rows.length) tables.push({header:hdr, rows});
   });
   return tables[0]||null;
@@ -249,7 +247,7 @@ function tableByHeaders($, patterns){
 function parseKeywordsHTML(html){
   const $=cheerio.load(html);
   const tbl = tableByHeaders($, [/^keyword$/, /volume|avg.*search|searches/, /(etsy\s*comp|competition)/i]);
-  if (!tbl) return {count:0, results:[], ...htmlStats(html)};
+  if (!tbl) return {count:0, results:[], htmlLength: (html?.length||0), totalKeywords:(html?.match(/keyword/gi)||[]).length};
   const k = tbl.header.findIndex(h=>/keyword/.test(h));
   const v = tbl.header.findIndex(h=>/(volume|avg.*search|searches)/i.test(h));
   const c = tbl.header.findIndex(h=>/(etsy\s*comp|competition)/i.test(h));
@@ -261,7 +259,7 @@ function parseKeywordsHTML(html){
   }).filter(Boolean);
   const seen=new Set();
   rows = rows.filter(x=>{ const key=x.keyword.toLowerCase(); if(seen.has(key)) return false; seen.add(key); return true;});
-  return {count:rows.length, results:rows, ...htmlStats(html)};
+  return {count:rows.length, results:rows, htmlLength: (html?.length||0), totalKeywords:(html?.match(/keyword/gi)||[]).length};
 }
 function parseTopListingsHTML(html){
   const $=cheerio.load(html);
@@ -273,7 +271,7 @@ function parseTopListingsHTML(html){
     const title=(a.text()||'').trim() || $(el).text().trim();
     items.push( normalizeListing({listing_id:id, url:href, title}) );
   });
-  return {count:items.length, results:items.filter(Boolean), ...htmlStats(html)};
+  return {count:items.length, results:items.filter(Boolean), htmlLength: (html?.length||0), totalKeywords:(html?.match(/keyword/gi)||[]).length};
 }
 
 /* ===========================
@@ -309,6 +307,20 @@ async function typeAndSearch(page, q){
     await input.press('Enter').catch(()=>{});
     await page.waitForSelector('table tbody tr td, [data-listing-id], [data-keyword], .ant-empty',{timeout:20000}).catch(()=>{});
   }catch(e){ console.error('typeAndSearch:', e.message); }
+}
+async function openTab(page, name){
+  const rx = new RegExp(`^${name.replace(/\s+/g,'\\s+')}$`, 'i');
+  const tab = page.getByRole('tab', { name: rx });
+  if (await tab.isVisible().catch(()=>false)){
+    await tab.click().catch(()=>{}); await page.waitForLoadState('networkidle',{timeout:20000}).catch(()=>{});
+    return true;
+  }
+  const loc = page.locator('text=' + name).first();
+  if (await loc.isVisible().catch(()=>false)){
+    await loc.click().catch(()=>{}); await page.waitForLoadState('networkidle',{timeout:20000}).catch(()=>{});
+    return true;
+  }
+  return false;
 }
 async function autoScroll(page, steps=4){ for(let i=0;i<steps;i++){ await page.evaluate(()=>window.scrollBy(0, window.innerHeight*0.85)); await sleep(250); } }
 async function enrichShops(page, items){
@@ -349,7 +361,7 @@ app.get('/debug/cookies', async (_q,r)=>{ try{ await ensureBrowser(); const ck=a
 app.get('/erank/raw', async (req,res)=>{ const p=(req.query.path||'/dashboard').toString(); try{ await ensureBrowser(); const pg=await context.newPage(); await loginIfNeeded(pg); await openAndWait(pg, `${BASE}${p.startsWith('/')?'':'/'}${p}`, `${BASE}/`); const html=await pg.content(); await pg.close(); res.set('content-type','text/html; charset=utf-8').send(html);}catch(e){res.status(500).json({error:e.message});}});
 
 /* ===========================
-   KEYWORDS (TOP N)
+   KEYWORDS (TOP N) — robust
 =========================== */
 app.get('/erank/keywords', async (req,res)=>{
   const q=(req.query.q||'').toString().trim();
@@ -363,22 +375,33 @@ app.get('/erank/keywords', async (req,res)=>{
       await openAndWait(pg, `${ BASE }/keyword-tool`, `${BASE}/`);
       await ensureMarketplaceCountry(pg, market, country);
       await typeAndSearch(pg, q);
-      for(let i=0;i<2;i++) await pg.waitForResponse(r=>/keyword|search|inertia/i.test(r.url())&&r.status()===200,{timeout:5000}).catch(()=>{});
 
-      const cap = await captureJson(pg, x=>x&&typeof x==='object'&&('keyword'in x || 'term'in x), 4500);
-      await autoScroll(pg,4);
+      // fuerza pestaña “Keyword Ideas”
+      await openTab(pg, 'Keyword Ideas');
+
+      // espera XHR relevantes y captura 6.5s
+      for(let i=0;i<2;i++){ await pg.waitForResponse(r=>/keyword|search|inertia|ideas/i.test(r.url())&&r.status()===200,{timeout:6000}).catch(()=>{}); }
+      const cap = await captureJson(pg, x=>x&&typeof x==='object'&&('keyword'in x || 'term'in x), 6500);
+
+      await autoScroll(pg,6);
 
       let items=[];
       for (const h of cap) for (const arr of h.arrays) for (const o of arr){ const nk=normalizeKeyword(o); if (nk) items.push(nk); }
 
-      if (!items.length){ await pg.waitForSelector('table tbody tr td, [data-keyword], .ant-empty',{timeout:4000}).catch(()=>{}); const html=await pg.content(); items = parseKeywordsHTML(html).results; }
+      // fallback DOM/HTML
+      if (!items.length){
+        await pg.waitForSelector('table tbody tr td, [data-keyword], .ant-empty',{timeout:5000}).catch(()=>{});
+        const html=await pg.content(); items = parseKeywordsHTML(html).results;
+      }
       await pg.close();
 
+      // dedupe + rank
       const seen=new Set();
-      items = items.filter(x=>{ const k=(x.keyword||'').toLowerCase(); if(!k||seen.has(k))return false; seen.add(k); return true; });
+      items = (items || []).filter(x=>{ const k=(x.keyword||'').toLowerCase(); if(!k||seen.has(k))return false; seen.add(k); return true; });
       items.forEach(x=> x.score=score(x.volume, compToInt(x.competition)));
       items.sort((a,b)=> b.score - a.score || toInt(b.volume)-toInt(a.volume));
 
+      if (!items.length) return { query:q, country, marketplace:market, count:0, results:[], reason:'no-xhr-or-empty-dom' };
       return { query:q, country, marketplace:market, count:Math.min(items.length,limit), results:items.slice(0,limit) };
     }, 'keywords');
     res.json(out);
@@ -386,7 +409,7 @@ app.get('/erank/keywords', async (req,res)=>{
 });
 
 /* ===========================
-   TAGS (TOP N)
+   TAGS (TOP N) — robust
 =========================== */
 app.get('/erank/tags', async (req,res)=>{
   const limit  = Math.max(1,Math.min(200, parseInt(req.query.limit||DEFAULT_TAG_N,10)));
@@ -399,6 +422,7 @@ app.get('/erank/tags', async (req,res)=>{
     await ensurePeriod(pg, period);
     await pg.waitForTimeout(600);
     await autoScroll(pg,6);
+
     const cap = await captureJson(pg, x=>x&&typeof x==='object'&&('tag'in x), 2500);
 
     let rows=[];
@@ -410,6 +434,7 @@ app.get('/erank/tags', async (req,res)=>{
     }
 
     if(!rows.length){
+      // DOM
       rows = await pg.evaluate(()=>{
         const out=[]; const t=document.querySelector('table'); if(!t) return out;
         const headers=Array.from(t.querySelectorAll('thead th, tr th')).map(th=>th.textContent.trim().toLowerCase());
@@ -427,6 +452,7 @@ app.get('/erank/tags', async (req,res)=>{
       });
       rows = rows.map(r=> ({...r, score: score(r.avg_searches, r.etsy_competition)}));
       if(!rows.length){
+        // Cheerio
         const html=await pg.content(); const $=cheerio.load(html);
         const tbl=tableByHeaders($, [/^tag$/, /avg.*search|searches/, /competition|etsy/]);
         if (tbl){
@@ -449,39 +475,62 @@ app.get('/erank/tags', async (req,res)=>{
 });
 
 /* ===========================
-   TOP LISTINGS (reusable)
+   TOP LISTINGS — reusable & robust
 =========================== */
-async function getTopListings({q,country,market,limit,period}){
+async function getTopListings({ q, country, market, limit, period }){
   await ensureBrowser(); const pg=await context.newPage(); await loginIfNeeded(pg);
+
   await openAndWait(pg, `${BASE}/keyword-tool`, `${BASE}/`);
   await ensureMarketplaceCountry(pg, market, country);
   await ensurePeriod(pg, period);
   await typeAndSearch(pg, q);
 
-  const tab=pg.getByRole('tab',{name:/top listings/i});
-  if (await tab.isVisible().catch(()=>false)){ await tab.click().catch(()=>{}); await pg.waitForLoadState('networkidle',{timeout:30000}).catch(()=>{}); }
-  else { await pg.locator('text=Top Listings').first().click().catch(()=>{}); await pg.waitForLoadState('networkidle',{timeout:30000}).catch(()=>{}); }
+  // Top Listings tab
+  await openTab(pg, 'Top Listings');
 
-  const more = pg.locator('button:has-text("Load more"), button:has-text("Show more")').first();
-  if (await more.isVisible().catch(()=>false)){ await more.click().catch(()=>{}); await pg.waitForLoadState('networkidle',{timeout:15000}).catch(()=>{}); }
+  // “Load more” bucles + scroll profundo
+  for (let i=0; i<3; i++) {
+    const more = pg.locator('button:has-text("Load more"), button:has-text("Show more")').first();
+    if (await more.isVisible().catch(()=>false)) {
+      await more.click().catch(()=>{});
+      await pg.waitForLoadState('networkidle',{timeout:15000}).catch(()=>{});
+    }
+    await autoScroll(pg, 6);
+  }
 
-  const cap = await captureJson(pg, x=>x&&typeof x==='object'&&( 'listing_id'in x || 'title'in x || 'url'in x || 'shop'in x ), 5000);
-  await autoScroll(pg,6);
+  // Captura XHR 8s (algunas vistas tardan)
+  const cap = await captureJson(pg, x=>x&&typeof x==='object' &&
+    ('listing_id'in x || 'title'in x || 'url'in x || 'shop' in x), 8000);
 
   let items=[];
-  for(const h of cap) for(const arr of h.arrays) for(const o of arr){ const n=normalizeListing(o); if(n) items.push(n); }
+  for (const h of cap) for (const arr of h.arrays) for (const o of arr){
+    const n=normalizeListing(o); if(n) items.push(n);
+  }
 
-  if(!items.length){ const html=await pg.content(); items = parseTopListingsHTML(html).results; }
+  // fallback HTML
+  if (!items.length) {
+    const html=await pg.content();
+    items = parseTopListingsHTML(html).results;
+  }
+
+  // enriquecer tiendas desde DOM
   items = await enrichShops(pg, items);
   await pg.close();
 
+  // filtra vacíos + dedupe
   const seen=new Set();
-  items = items.filter(x=>{ const k=(x.listing_id||'')+'|'+(x.href||''); if(!k.trim())return false; if(seen.has(k))return false; seen.add(k); return true; })
-               .slice(0,limit);
-  return items;
+  items = items.filter(r=>{
+    const k=(r.listing_id||'')+'|'+(r.href||'');
+    if (!r.listing_id && !r.href) return false;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+
+  return items.slice(0, limit);
 }
 
-/* public: top-listings (eRank order, enriched) */
+/* public: top-listings (orden original eRank, enriquecido) */
 app.get('/erank/top-listings', async (req,res)=>{
   const q=(req.query.q||'').toString().trim();
   if(!q) return res.status(400).json({error:'Missing ?q='});
@@ -490,7 +539,7 @@ app.get('/erank/top-listings', async (req,res)=>{
   const market  = (req.query.marketplace||DEFAULT_MARKET).toLowerCase();
   const period  = (req.query.period||'').toString();
   try{
-    const results = await withRetries(()=> getTopListings({q, country, market, limit, period}), 'top-listings');
+    const results = await withRetries(()=> getTopListings({ q, country, market, limit, period }), 'top-listings');
     res.json({ query:q, country, marketplace:market, count:results.length, results });
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -505,7 +554,12 @@ app.get('/erank/top-products', async (req,res)=>{
   const period  = (req.query.period||'').toString();
   const sortBy  = (req.query.sort_by||'score').toLowerCase(); // score|sales|views|favs
   try{
-    const items = await withRetries(()=> getTopListings({q,country,market,limit:200,period}), 'top-products');
+    const items = await withRetries(()=> getTopListings({ q, country, market, limit: 200, period }), 'top-products');
+
+    // elimina placeholders totalmente vacíos
+    const filtered = items.filter(x => (x.listing_id || x.href) && (x.score>0 || x.sales>0 || x.views>0 || x.favorites>0));
+    const arr = filtered.length ? filtered : items;
+
     const rankers = {
       score:(a,b)=>(b.score||0)-(a.score||0),
       sales:(a,b)=>(b.sales||0)-(a.sales||0),
@@ -513,12 +567,14 @@ app.get('/erank/top-products', async (req,res)=>{
       favs :(a,b)=>(b.favorites||0)-(a.favorites||0),
     };
     const sorter = rankers[sortBy] || rankers.score;
-    const results = items.sort(sorter).slice(0,limit);
+    const results = arr.sort(sorter).slice(0,limit);
     res.json({ query:q, country, marketplace:market, period, sort_by:sortBy, count:results.length, results });
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 
-/* my-shop & stats */
+/* ===========================
+   my-shop & stats
+=========================== */
 app.get('/erank/my-shop', async (_req,res)=>{
   try{
     await ensureBrowser(); const pg=await context.newPage(); await loginIfNeeded(pg);
@@ -536,7 +592,9 @@ app.get('/erank/stats', async (_req,res)=>{
   }catch(e){ res.status(409).json({error:e.message}); }
 });
 
-/* DEBUG screenshots */
+/* ===========================
+   DEBUG screenshots
+=========================== */
 app.get('/debug/keywords-screenshot', async (req,res)=>{
   const q=(req.query.q||'').toString().trim();
   const country=(req.query.country||DEFAULT_COUNTRY).toUpperCase();
@@ -562,13 +620,14 @@ app.get('/debug/toplist-screenshot', async (req,res)=>{
     await openAndWait(pg, `${BASE}/keyword-tool`, `${BASE}/`);
     await ensureMarketplaceCountry(pg, market, country);
     await typeAndSearch(pg, q);
-    const tab=pg.getByRole('tab',{name:/top listings/i});
-    if (await tab.isVisible().catch(()=>false)){ await tab.click().catch(()=>{}); await pg.waitForLoadState('networkidle',{timeout:30000}).catch(()=>{}); }
+    await openTab(pg, 'Top Listings');
     await pg.waitForTimeout(1200);
     const buf=await pg.screenshot({fullPage:true}); await pg.close();
     res.set('content-type','image/png').send(buf);
   }catch(e){ res.status(500).send(e.message); }
 });
 
-/* START */
+/* ===========================
+   START
+=========================== */
 app.listen(port, ()=> console.log(`[eRank] API listening on :${port} (stealth=${STEALTH_ON}, retries=${MAX_RETRIES})`));
