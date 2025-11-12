@@ -89,11 +89,9 @@ async function ensureBrowser(){
     locale: lang.startsWith('es')?'es-ES':'en-US',
     extraHTTPHeaders: { 'accept-language': lang, 'upgrade-insecure-requests':'1' }
   };
-  // ✅ usar storageState si existe
   if (fs.existsSync(STORAGE)) ctxOpts.storageState = STORAGE;
   context = await browser.newContext(ctxOpts);
 
-  // Cookies PRO (dos dominios)
   if (ERANK_COOKIES){
     const cookies = ERANK_COOKIES.split(';').map(s=>s.trim()).filter(Boolean).map(pair=>{
       const i=pair.indexOf('='); if (i<=0) return null;
@@ -247,7 +245,7 @@ function tableByHeaders($, patterns){
 function parseKeywordsHTML(html){
   const $=cheerio.load(html);
   const tbl = tableByHeaders($, [/^keyword$/, /volume|avg.*search|searches/, /(etsy\s*comp|competition)/i]);
-  if (!tbl) return {count:0, results:[], htmlLength: (html?.length||0), totalKeywords:(html?.match(/keyword/gi)||[]).length};
+  if (!tbl) return {count:0, results:[], htmlLength:(html?.length||0), totalKeywords:(html?.match(/keyword/gi)||[]).length};
   const k = tbl.header.findIndex(h=>/keyword/.test(h));
   const v = tbl.header.findIndex(h=>/(volume|avg.*search|searches)/i.test(h));
   const c = tbl.header.findIndex(h=>/(etsy\s*comp|competition)/i.test(h));
@@ -259,7 +257,7 @@ function parseKeywordsHTML(html){
   }).filter(Boolean);
   const seen=new Set();
   rows = rows.filter(x=>{ const key=x.keyword.toLowerCase(); if(seen.has(key)) return false; seen.add(key); return true;});
-  return {count:rows.length, results:rows, htmlLength: (html?.length||0), totalKeywords:(html?.match(/keyword/gi)||[]).length};
+  return {count:rows.length, results:rows, htmlLength:(html?.length||0), totalKeywords:(html?.match(/keyword/gi)||[]).length};
 }
 function parseTopListingsHTML(html){
   const $=cheerio.load(html);
@@ -271,7 +269,7 @@ function parseTopListingsHTML(html){
     const title=(a.text()||'').trim() || $(el).text().trim();
     items.push( normalizeListing({listing_id:id, url:href, title}) );
   });
-  return {count:items.length, results:items.filter(Boolean), htmlLength: (html?.length||0), totalKeywords:(html?.match(/keyword/gi)||[]).length};
+  return {count:items.length, results:items.filter(Boolean), htmlLength:(html?.length||0)};
 }
 
 /* ===========================
@@ -363,6 +361,21 @@ app.get('/erank/raw', async (req,res)=>{ const p=(req.query.path||'/dashboard').
 /* ===========================
    KEYWORDS (TOP N) — robust
 =========================== */
+async function readStatsPanel(page){
+  try{
+    return await page.evaluate(()=>{
+      const getNum = (s) => (s||'').replace(/,/g,'').match(/[\d.]+/)?.[0] || '';
+      let avg='', comp='';
+      document.querySelectorAll('*').forEach(n=>{
+        const t=(n.textContent||'').toLowerCase();
+        if (t.includes('avg') && t.includes('search')) avg = getNum(n.textContent);
+        if (t.includes('competition')) comp = n.textContent.trim();
+      });
+      return { avgSearches:avg, competition:comp };
+    });
+  }catch{ return { avgSearches:'', competition:'' }; }
+}
+
 app.get('/erank/keywords', async (req,res)=>{
   const q=(req.query.q||'').toString().trim();
   const limit=Math.max(1,Math.min(200, parseInt(req.query.limit||DEFAULT_KW_N,10)));
@@ -376,17 +389,29 @@ app.get('/erank/keywords', async (req,res)=>{
       await ensureMarketplaceCountry(pg, market, country);
       await typeAndSearch(pg, q);
 
-      // fuerza pestaña “Keyword Ideas”
+      // Keyword Ideas → XHR largo
       await openTab(pg, 'Keyword Ideas');
-
-      // espera XHR relevantes y captura 6.5s
       for(let i=0;i<2;i++){ await pg.waitForResponse(r=>/keyword|search|inertia|ideas/i.test(r.url())&&r.status()===200,{timeout:6000}).catch(()=>{}); }
-      const cap = await captureJson(pg, x=>x&&typeof x==='object'&&('keyword'in x || 'term'in x), 6500);
-
-      await autoScroll(pg,6);
+      let cap = await captureJson(pg, x=>x&&typeof x==='object'&&('keyword'in x || 'term'in x), 7000);
+      await autoScroll(pg, 6);
 
       let items=[];
       for (const h of cap) for (const arr of h.arrays) for (const o of arr){ const nk=normalizeKeyword(o); if (nk) items.push(nk); }
+
+      // Panel de stats como seed si no hay XHR
+      if (!items.length){
+        const s = await readStatsPanel(pg);
+        if (s.avgSearches) items.push({ keyword:q, volume:s.avgSearches, competition:s.competition, score: score(s.avgSearches, compToInt(s.competition)) });
+      }
+
+      // Near Matches como semillero adicional
+      if (items.length < limit){
+        await openTab(pg, 'Near Matches');
+        await pg.waitForResponse(r=>/near|match|keyword|inertia/i.test(r.url())&&r.status()===200,{timeout:5000}).catch(()=>{});
+        cap = await captureJson(pg, x=>x&&typeof x==='object'&&('keyword'in x || 'term'in x), 6000);
+        await autoScroll(pg, 4);
+        for (const h of cap) for (const arr of h.arrays) for (const o of arr){ const nk=normalizeKeyword(o); if(nk) items.push(nk); }
+      }
 
       // fallback DOM/HTML
       if (!items.length){
@@ -395,13 +420,12 @@ app.get('/erank/keywords', async (req,res)=>{
       }
       await pg.close();
 
-      // dedupe + rank
       const seen=new Set();
-      items = (items || []).filter(x=>{ const k=(x.keyword||'').toLowerCase(); if(!k||seen.has(k))return false; seen.add(k); return true; });
+      items = (items||[]).filter(x=>{ const k=(x.keyword||'').toLowerCase(); if(!k||seen.has(k))return false; seen.add(k); return true; });
       items.forEach(x=> x.score=score(x.volume, compToInt(x.competition)));
       items.sort((a,b)=> b.score - a.score || toInt(b.volume)-toInt(a.volume));
 
-      if (!items.length) return { query:q, country, marketplace:market, count:0, results:[], reason:'no-xhr-or-empty-dom' };
+      if (!items.length) return { query:q, country, marketplace:market, count:0, results:[], reason:'no-xhr-or-empty-dom-after-ideas+near-matches+panel' };
       return { query:q, country, marketplace:market, count:Math.min(items.length,limit), results:items.slice(0,limit) };
     }, 'keywords');
     res.json(out);
@@ -434,7 +458,6 @@ app.get('/erank/tags', async (req,res)=>{
     }
 
     if(!rows.length){
-      // DOM
       rows = await pg.evaluate(()=>{
         const out=[]; const t=document.querySelector('table'); if(!t) return out;
         const headers=Array.from(t.querySelectorAll('thead th, tr th')).map(th=>th.textContent.trim().toLowerCase());
@@ -452,7 +475,6 @@ app.get('/erank/tags', async (req,res)=>{
       });
       rows = rows.map(r=> ({...r, score: score(r.avg_searches, r.etsy_competition)}));
       if(!rows.length){
-        // Cheerio
         const html=await pg.content(); const $=cheerio.load(html);
         const tbl=tableByHeaders($, [/^tag$/, /avg.*search|searches/, /competition|etsy/]);
         if (tbl){
@@ -485,20 +507,17 @@ async function getTopListings({ q, country, market, limit, period }){
   await ensurePeriod(pg, period);
   await typeAndSearch(pg, q);
 
-  // Top Listings tab
   await openTab(pg, 'Top Listings');
 
-  // “Load more” bucles + scroll profundo
   for (let i=0; i<3; i++) {
     const more = pg.locator('button:has-text("Load more"), button:has-text("Show more")').first();
     if (await more.isVisible().catch(()=>false)) {
       await more.click().catch(()=>{});
-      await pg.waitForLoadState('networkidle',{timeout:15000}).catch(()=>{});
+      await pg.waitForLoadState('networkidle', { timeout: 15000 }).catch(()=>{});
     }
     await autoScroll(pg, 6);
   }
 
-  // Captura XHR 8s (algunas vistas tardan)
   const cap = await captureJson(pg, x=>x&&typeof x==='object' &&
     ('listing_id'in x || 'title'in x || 'url'in x || 'shop' in x), 8000);
 
@@ -507,17 +526,14 @@ async function getTopListings({ q, country, market, limit, period }){
     const n=normalizeListing(o); if(n) items.push(n);
   }
 
-  // fallback HTML
   if (!items.length) {
     const html=await pg.content();
     items = parseTopListingsHTML(html).results;
   }
 
-  // enriquecer tiendas desde DOM
   items = await enrichShops(pg, items);
   await pg.close();
 
-  // filtra vacíos + dedupe
   const seen=new Set();
   items = items.filter(r=>{
     const k=(r.listing_id||'')+'|'+(r.href||'');
@@ -555,8 +571,6 @@ app.get('/erank/top-products', async (req,res)=>{
   const sortBy  = (req.query.sort_by||'score').toLowerCase(); // score|sales|views|favs
   try{
     const items = await withRetries(()=> getTopListings({ q, country, market, limit: 200, period }), 'top-products');
-
-    // elimina placeholders totalmente vacíos
     const filtered = items.filter(x => (x.listing_id || x.href) && (x.score>0 || x.sales>0 || x.views>0 || x.favorites>0));
     const arr = filtered.length ? filtered : items;
 
@@ -605,6 +619,7 @@ app.get('/debug/keywords-screenshot', async (req,res)=>{
     await openAndWait(pg, `${BASE}/keyword-tool`, `${BASE}/`);
     await ensureMarketplaceCountry(pg, market, country);
     await typeAndSearch(pg, q);
+    await openTab(pg, 'Keyword Ideas');
     await pg.waitForTimeout(1200);
     const buf=await pg.screenshot({ fullPage:true }); await pg.close();
     res.set('content-type','image/png').send(buf);
