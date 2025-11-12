@@ -1,4 +1,4 @@
-// index.js — eRank PRO scraper FINAL (TopN + scoring + debug) — fixed syntax
+// index.js — eRank PRO scraper FINAL (TopN + scoring + debug) — clean syntax
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -6,7 +6,7 @@ const express = require('express');
 const cheerio = require('cheerio');
 const { chromium } = require('playwright');
 
-const app  = express();
+const app = express();
 const port = process.env.PORT || 3000;
 
 /* ===========================
@@ -79,17 +79,21 @@ async function recycleContext(reason='recycle'){
 async function ensureBrowser(){
   if (browser && context) return;
   browser = await chromium.launch({ headless:true, args:['--no-sandbox','--disable-dev-shm-usage'] });
+
   const ua   = pick(UA_POOL);
   const lang = pick(LANG_POOL);
+
   const ctxOpts = {
     baseURL: BASE,
     userAgent: ua,
     locale: lang.startsWith('es')?'es-ES':'en-US',
-    extraHTTPHeaders: { 'accept-language': lang, 'upgrade-insecure-requests':'1' },
+    extraHTTPHeaders: { 'accept-language': lang, 'upgrade-insecure-requests':'1' }
   };
-  context = await browser.newContext(fs.existsSync(STORAGE) ? { ...ctxOpts, storageState:ST:$ } : ctxOpts);
-  if (fs.existsSync(STORAGE)) { /* already loaded */ }
+  // ✅ Parche: crear contexto correctamente (storageState si existe)
+  if (fs.existsSync(STORAGE)) ctxOpts.storageState = STORAGE;
+  context = await browser.newContext(ctxOpts);
 
+  // Cookies PRO
   if (ERANK_COOKIES){
     const cookies = ERANK_COOKIES.split(';').map(s=>s.trim()).filter(Boolean).map(pair=>{
       const i=pair.indexOf('='); if (i<=0) return null;
@@ -103,7 +107,7 @@ async function ensureBrowser(){
     try{ await context.addCookies(both); }catch(e){ console.error('addCookies:', e.message); }
   }
 }
-async function saveState(){ try{ if (context) await context.context ? context.context().storageState({path:STORAGE}) : context.storageState({path:STORAGE}); }catch{} }
+async function saveState(){ try{ if (context) await context.storageState({path:STORAGE}); }catch{} }
 
 async function openAndWait(page, url, referer){
   if (referer) await page.setExtraHTTPHeaders({ referer });
@@ -192,7 +196,7 @@ function normVal(v){
     return '';
   }
 }
-function mapCompetitionToInt(c){
+function compToInt(c){
   const t=(c||'').toLowerCase();
   if (!t || /\d/.test(t)) return toInt(c);
   if (/very\s*high/.test(t)) return 100000;
@@ -202,18 +206,18 @@ function mapCompetitionToInt(c){
   return 0;
 }
 function normalizeKeyword(o){
-  const kw = (o?.keyword ?? o?.term ?? o?.query ?? '').toString().trim();
+  const kw=(o?.keyword ?? o?.term ?? o?.query ?? '').toString().trim();
   if (!kw) return null;
   const volume = normVal(o?.volume ?? o?.searches ?? o?.avg_searches ?? o?.metrics);
-  let   comp   = normVal(o?.competition ?? o?.etsy_competition ?? o?.comp ?? '');
-  const compN  = mapCompetitionToInt(comp);
-  return { keyword:kw, volume, competition: comp || (compN?String(compN):''), score: score(volume, compN) };
+  let comp     = normVal(o?.competition ?? o?.etsy_competition ?? o?.comp ?? '');
+  const cNum   = compToInt(comp);
+  return { keyword:kw, volume, competition: comp || (cNum?String(cNum):''), score: score(volume, cNum) };
 }
 function normalizeListing(o){
   const b=o||{};
-  let id = b.listing_id ?? b.id ?? b?.listing?.id ?? b?.listing?.listing_id ?? '';
-  let href = (b.url ?? b.link ?? b.permalink ?? b?.listing?.url ?? b?.listing?.link ?? '').toString().trim();
-  let title= (b.title ?? b.name ?? b?.listing?.title ?? b?.listing?.name ?? '').toString().trim();
+  let id    = b.listing_id ?? b.id ?? b?.listing?.id ?? b?.listing?.listing_id ?? '';
+  let href  = (b.url ?? b.link ?? b.permalink ?? b?.listing?.url ?? b?.listing?.link ?? '').toString().trim();
+  let title = (b.title ?? b.name ?? b?.listing?.title ?? b?.listing?.name ?? '').toString().trim();
   if (!id && href){ const m=href.match(/\/listing\/(\d+)/i); if (m) id=m[1]; }
   if (!href && id) href = `https://www.etsy.com/listing/${id}`;
   const views = toInt(b.views ?? b?.listing_views);
@@ -228,6 +232,20 @@ function normalizeListing(o){
 /* ===========================
    HTML FALLBACK PARSERS
 =========================== */
+function htmlStats(html){ return { htmlLength:(html?.length||0), totalKeywords:(html?.match(/keyword/gi)||[]).length }; }
+function tableByHeaders($, patterns){
+  const tables=[];
+  $('table').each((_,t)=>{
+    const $t=$(t), hdr=[];
+    $t.find('thead th, tr th').each((__,th)=> hdr.push($(th).text().trim().toLowerCase()));
+    if (!hdr.length) return;
+    if (!patterns.every(rx=> hdr.some(h=>rx.test(h)))) return;
+    const rows=[];
+    $t.find('tbody tr').each((__,tr)=>{ const tds=$(tr).find('td'); if(!tds.length) return; rows.push(tds.map((__,td)=>$(td).text().trim()).get()); });
+    if (rows.length) tables.push({header:hdr, rows});
+  });
+  return tables[0]||null;
+}
 function parseKeywordsHTML(html){
   const $=cheerio.load(html);
   const tbl = tableByHeaders($, [/^keyword$/, /volume|avg.*search|searches/, /(etsy\s*comp|competition)/i]);
@@ -239,7 +257,7 @@ function parseKeywordsHTML(html){
     const kw=(r[k]||'').trim(); if(!kw) return null;
     const vol=(r[v]||'').trim();
     const cp = c>=0 ? (r[c]||'').trim() : '';
-    return { keyword:kw, volume:vol, competition:cp, score:score(vol, mapCompetitionToInt(cp)) };
+    return { keyword:kw, volume:vol, competition:cp, score:score(vol, compToInt(cp)) };
   }).filter(Boolean);
   const seen=new Set();
   rows = rows.filter(x=>{ const key=x.keyword.toLowerCase(); if(seen.has(key)) return false; seen.add(key); return true;});
@@ -249,7 +267,7 @@ function parseTopListingsHTML(html){
   const $=cheerio.load(html);
   const items=[];
   $('[data-listing-id]').each((_,el)=>{
-    const id=$(el).attr('data-value')||$(el).attr('data-listing-id')||'';
+    const id=$(el).attr('data-listing-id') || $(el).attr('data-value') || '';
     const a=$(el).find('a[href*="/listing/"]').first();
     const href=a.attr('href')||'';
     const title=(a.text()||'').trim() || $(el).text().trim();
@@ -257,25 +275,11 @@ function parseTopListingsHTML(html){
   });
   return {count:items.length, results:items.filter(Boolean), ...htmlStats(html)};
 }
-function htmlStats(html){ return { htmlLength:(html?.length||0), totalKeywords:(html?.match(/keyword/gi)||[]).length }; }
-function tableByHeaders($, patterns){
-  const tables=[];
-  $('table').each((_,t)=>{
-    const $t=$(t);
-    const hdr=[]; $t.find('thead th, tr th').each((__,th)=> hdr.push($(th).text().trim().toLowerCase()));
-    if (!hdr.length) return;
-    if (!patterns.every(rx=> hdr.some(h=>rx.test(h)))) return;
-    const rows=[]; $t.find('tbody tr').each((__,tr)=>{ const tds=$(tr).find('td'); if(!tds.length) return; rows.push(tds.map((__,td)=>$(td).text().trim()).get()); });
-    if (rows.length) tables.push({header:hdr, rows});
-  });
-  return tables[0]||null;
-}
 
 /* ===========================
    UI HELPERS
 =========================== */
 async function ensureMarketplaceCountry(page, market, country){
-  const mp=page.getVisible ? page.getVisible() : page;
   const mpBtn = page.getByRole('button',{name:/marketplace/i}).or(page.getByRole('combobox').nth(0));
   if (await mpBtn.isVisible().catch(()=>false)){ await mpBtn.click().catch(()=>{}); await page.getByRole('option',{name:new RegExp(`^${market}$`,'i')}).click().catch(()=>{}); }
   const cBtn  = page.getByRole('button',{name:/country/i}).or(page.getByRole('combobox').nth(1));
@@ -337,9 +341,9 @@ async function enrichShops(page, items){
    MIDDLEWARES & HEALTH
 =========================== */
 app.use((req,_res,next)=>{ if (req.url.includes('//')) req.url=req.url.replace(/\/{2,}/g,'/'); next(); });
-app.use((req,_res,next)=>{ void jitter().then(()=>next()); });
+app.use(async (_req,_res,next)=>{ await jitter(); next(); });
 
-app.get('/healthz',     (_q,r)=>r.json({ok:true,service:'erank-scraper',stealth:STEALTH_ON}));
+app.get('/healthz',      (_q,r)=>r.json({ok:true,service:'erank-scraper',stealth:STEALTH_ON}));
 app.get('/erank/healthz',(_q,r)=>r.json({ok:true,alias:'erank/healthz',stealth:STEALTH_ON}));
 app.get('/debug/cookies', async (_q,r)=>{ try{ await ensureBrowser(); const ck=await context.cookies('https://members.erank.com'); r.json({count:ck.length, cookies:ck.map(c=>({name:c.name,domain:c.domain}))}); }catch(e){ r.status(500).json({error:e.message}); }});
 app.get('/erank/raw', async (req,res)=>{ const p=(req.query.path||'/dashboard').toString(); try{ await ensureBrowser(); const pg=await context.newPage(); await loginIfNeeded(pg); await openAndWait(pg, `${BASE}${p.startsWith('/')?'':'/'}${p}`, `${BASE}/`); const html=await pg.content(); await pg.close(); res.set('content-type','text/html; charset=utf-8').send(html);}catch(e){res.status(500).json({error:e.message});}});
@@ -360,16 +364,21 @@ app.get('/erank/keywords', async (req,res)=>{
       await ensureMarketplaceCountry(pg, market, country);
       await typeAndSearch(pg, q);
       for(let i=0;i<2;i++) await pg.waitForResponse(r=>/keyword|search|inertia/i.test(r.url())&&r.status()===200,{timeout:5000}).catch(()=>{});
+
       const cap = await captureJson(pg, x=>x&&typeof x==='object'&&('keyword'in x || 'term'in x), 4500);
       await autoScroll(pg,4);
+
       let items=[];
       for (const h of cap) for (const arr of h.arrays) for (const o of arr){ const nk=normalizeKeyword(o); if (nk) items.push(nk); }
+
       if (!items.length){ await pg.waitForSelector('table tbody tr td, [data-keyword], .ant-empty',{timeout:4000}).catch(()=>{}); const html=await pg.content(); items = parseKeywordsHTML(html).results; }
       await pg.close();
+
       const seen=new Set();
-      items = items.filter(x=>{ const k=x.keyword.toLowerCase(); if(!k||seen.has(k))return false; seen.add(k); return true; });
-      items.forEach(x=> x.score=score(x.volume, mapCompetitionToInt(x.competition)));
+      items = items.filter(x=>{ const k=(x.keyword||'').toLowerCase(); if(!k||seen.has(k))return false; seen.add(k); return true; });
+      items.forEach(x=> x.score=score(x.volume, compToInt(x.competition)));
       items.sort((a,b)=> b.score - a.score || toInt(b.volume)-toInt(a.volume));
+
       return { query:q, country, marketplace:market, count:Math.min(items.length,limit), results:items.slice(0,limit) };
     }, 'keywords');
     res.json(out);
@@ -386,11 +395,12 @@ app.get('/erank/tags', async (req,res)=>{
   const period =(req.query.period||'').toString();
   try{
     await ensureBrowser(); const pg=await context.newPage(); await loginIfNeeded(pg);
-    await openAndWait(pg, `${BASE}/tags?${new URLSearchParams({country}).toString()}`, `${BASE}/`);
+    await openAndWait(pg, `${BASE}/tags?country=${encodeURIComponent(country)}`, `${BASE}/`);
     await ensurePeriod(pg, period);
     await pg.waitForTimeout(600);
     await autoScroll(pg,6);
     const cap = await captureJson(pg, x=>x&&typeof x==='object'&&('tag'in x), 2500);
+
     let rows=[];
     for(const h of cap) for(const arr of h.arrays) for(const o of arr){
       const tag=(o.tag||'').toString().trim(); if(!tag) continue;
@@ -398,19 +408,19 @@ app.get('/erank/tags', async (req,res)=>{
       const c = normVal(o.etsy_competition ?? o.competition ?? '');
       rows.push({ tag, avg_searches:a, etsy_competition:c, score:score(a,c) });
     }
+
     if(!rows.length){
-      // DOM fallback
       rows = await pg.evaluate(()=>{
         const out=[]; const t=document.querySelector('table'); if(!t) return out;
-        const headers = Array.from(t.querySelectorAll('thead th, tr th')).map(th=>th.textContent.trim().toLowerCase());
+        const headers=Array.from(t.querySelectorAll('thead th, tr th')).map(th=>th.textContent.trim().toLowerCase());
         const iTag  = headers.findIndex(h=>h==='tag');
         const iSrch = headers.findIndex(h=>/avg.*search|searches/.test(h));
         const iComp = headers.findIndex(h=>/competition|etsy/.test(h));
         t.querySelectorAll('tbody tr').forEach(tr=>{
           const td=Array.from(tr.children).map(x=>x.textContent.trim());
           const tag = iTag>=0? td[iTag] : '';
-          const a   = iSrch>=0? td[iSrch] : '';
-          const c   = iComp>=0? td[iComp] : '';
+          const a   = iSrch>=0? td[iSrch]: '';
+          const c   = iComp>=0? td[iComp]: '';
           if (tag) out.push({tag, avg_searches:a, etsy_competition:c});
         });
         return out;
@@ -418,11 +428,11 @@ app.get('/erank/tags', async (req,res)=>{
       rows = rows.map(r=> ({...r, score: score(r.avg_searches, r.etsy_competition)}));
       if(!rows.length){
         const html=await pg.content(); const $=cheerio.load(html);
-        const tbl = tableByHeaders($, [/^tag$/, /avg.*search|searches/, /competition|etsy/]);
+        const tbl=tableByHeaders($, [/^tag$/, /avg.*search|searches/, /competition|etsy/]);
         if (tbl){
           const iTag = tbl.header.findIndex(h=>h==='tag');
           const iSrch= tbl.header.findIndex(h=>/avg.*search|searches/.test(h));
-          const iComp= tbl.string? -1 : tbl.header.findIndex(h=>/competition|etsy/.test(h));
+          const iComp= tbl.header.findIndex(h=>/competition|etsy/.test(h));
           rows = tbl.rows.map(r=>{
             const t=(r[iTag]||'').trim(); if(!t) return null;
             const a=(iSrch>=0? r[iSrch]:'');
@@ -471,7 +481,7 @@ async function getTopListings({q,country,market,limit,period}){
   return items;
 }
 
-/* public: top-listings (as eRank order, enriched) */
+/* public: top-listings (eRank order, enriched) */
 app.get('/erank/top-listings', async (req,res)=>{
   const q=(req.query.q||'').toString().trim();
   if(!q) return res.status(400).json({error:'Missing ?q='});
@@ -493,9 +503,9 @@ app.get('/erank/top-products', async (req,res)=>{
   const country = (req.query.country||DEFAULT_COUNTRY).toUpperCase();
   const market  = (req.query.marketplace||DEFAULT_MARKET).toLowerCase();
   const period  = (req.query.period||'').toString();
-  const sortBy  = (req.query.sort_by||'score').toLowerCase();
+  const sortBy  = (req.query.sort_by||'score').toLowerCase(); // score|sales|views|favs
   try{
-    const items = await withRetries(()=> getTopListings({q,country,market:market,limit:200,period}), 'top-products');
+    const items = await withRetries(()=> getTopListings({q,country,market,limit:200,period}), 'top-products');
     const rankers = {
       score:(a,b)=>(b.score||0)-(a.score||0),
       sales:(a,b)=>(b.sales||0)-(a.sales||0),
@@ -560,5 +570,5 @@ app.get('/debug/toplist-screenshot', async (req,res)=>{
   }catch(e){ res.status(500).send(e.message); }
 });
 
-/* start */
+/* START */
 app.listen(port, ()=> console.log(`[eRank] API listening on :${port} (stealth=${STEALTH_ON}, retries=${MAX_RETRIES})`));
