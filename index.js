@@ -534,7 +534,7 @@ async function getTopListings({ q, country, market, limit, period }){
   items = await enrichShops(pg, items);
   await pg.close();
 
-  const seen=new Set();
+  const seen=newSet = new Set();
   items = items.filter(r=>{
     const k=(r.listing_id||'')+'|'+(r.href||'');
     if (!r.listing_id && !r.href) return false;
@@ -601,7 +601,6 @@ app.get('/erank/my-shop', async (_req, res) => {
       const dedupeSimple = (arr) => {
         const s = new Set();
         return arr.filter(x => {
-          // normalizamos a string de forma segura
           const raw =
             typeof x === 'string'
               ? x
@@ -767,7 +766,7 @@ app.get('/erank/my-shop', async (_req, res) => {
         return { topTags, tagReport };
       };
 
-      // C) Traffic Stats (/traffic-stats)
+      // C) Traffic Stats (/traffic-stats) — parser genérico sobre todas las tablas
       const getTrafficStats = async () => {
         await openAndWait(page, `${BASE}/traffic-stats`, `${BASE}/dashboard`);
         await page.waitForTimeout(800);
@@ -776,72 +775,90 @@ app.get('/erank/my-shop', async (_req, res) => {
         const html = await page.content();
         const $ = cheerio.load(html);
 
-        const parseSectionTable = (headingRegex, colMap) => {
-          const headingNode = $('*')
-            .filter((_, el) => headingRegex.test(($(el).text() || '').trim()))
-            .first();
-          if (!headingNode.length) return [];
+        const topSources   = [];
+        const topKeywords  = [];
+        const topDevices   = [];
+        const topCities    = [];
+        const topCountries = [];
 
-          let container = headingNode.closest('section');
-          if (!container.length) container = headingNode.parent();
-
-          const table = container.find('table').first();
-          if (!table.length) return [];
+        $('table').each((_, t) => {
+          const table = $(t);
 
           const headers = [];
-          table.find('thead th, tr th').each((_, th) =>
+          table.find('thead th, tr th').each((__, th) =>
             headers.push($(th).text().trim().toLowerCase())
           );
-          if (!headers.length) return [];
+          if (!headers.length) return;
 
-          const getIndex = (regex) =>
-            headers.findIndex(h => regex.test(h));
-
-          const idx = {};
-          for (const [key, regex] of Object.entries(colMap)) {
-            idx[key] = getIndex(regex);
-          }
+          const has = (rx) => headers.some(h => rx.test(h));
 
           const rows = [];
-          table.find('tbody tr').each((_, tr) => {
+          table.find('tbody tr').each((__, tr) => {
             const tds = $(tr).find('td');
             if (!tds.length) return;
-            const row = {};
-            for (const [key, i] of Object.entries(idx)) {
-              if (i >= 0 && i < tds.length) {
-                row[key] = $(tds[i]).text().trim();
-              } else {
-                row[key] = '';
-              }
-            }
-            rows.push(row);
+            rows.push(tds.map((___, td) => $(td).text().trim()).get());
           });
-          return rows;
-        };
+          if (!rows.length) return;
 
-        const topSources = parseSectionTable(/top\s+sources/i, {
-          source: /source|referrer/i,
-          visits: /visits|sessions|traffic/i
-        });
+          if (has(/source|referrer/)) {
+            const iSource = headers.findIndex(h => /source|referrer/.test(h));
+            const iVisits = headers.findIndex(h => /visit|session|traffic/.test(h));
+            rows.forEach(r => {
+              topSources.push({
+                source: (r[iSource] || '').toString().trim(),
+                visits: (r[iVisits] || '').toString().trim()
+              });
+            });
+            return;
+          }
 
-        const topKeywords = parseSectionTable(/top\s+keywords/i, {
-          keyword: /keyword|search term/i,
-          visits: /visits|clicks|sessions/i
-        });
+          if (has(/keyword|search term/)) {
+            const iKw = headers.findIndex(h => /keyword|search term/.test(h));
+            const iVis = headers.findIndex(h => /visit|click|session/.test(h));
+            rows.forEach(r => {
+              topKeywords.push({
+                keyword: (r[iKw] || '').toString().trim(),
+                visits: (r[iVis] || '').toString().trim()
+              });
+            });
+            return;
+          }
 
-        const topDevices = parseSectionTable(/top\s+devices/i, {
-          device: /device/i,
-          visits: /visits|sessions|traffic/i
-        });
+          if (has(/device/)) {
+            const iDev = headers.findIndex(h => /device/.test(h));
+            const iVis = headers.findIndex(h => /visit|session|traffic/.test(h));
+            rows.forEach(r => {
+              topDevices.push({
+                device: (r[iDev] || '').toString().trim(),
+                visits: (r[iVis] || '').toString().trim()
+              });
+            });
+            return;
+          }
 
-        const topCities = parseSectionTable(/top\s+cities/i, {
-          city: /city/i,
-          visits: /visits|sessions|traffic/i
-        });
+          if (has(/city/)) {
+            const iCity = headers.findIndex(h => /city/.test(h));
+            const iVis  = headers.findIndex(h => /visit|session|traffic/.test(h));
+            rows.forEach(r => {
+              topCities.push({
+                city: (r[iCity] || '').toString().trim(),
+                visits: (r[iVis]  || '').toString().trim()
+              });
+            });
+            return;
+          }
 
-        const topCountries = parseSectionTable(/top\s+countries/i, {
-          country: /country/i,
-          visits: /visits|sessions|traffic/i
+          if (has(/country/)) {
+            const iCountry = headers.findIndex(h => /country/.test(h));
+            const iVis     = headers.findIndex(h => /visit|session|traffic/.test(h));
+            rows.forEach(r => {
+              topCountries.push({
+                country: (r[iCountry] || '').toString().trim(),
+                visits: (r[iVis]     || '').toString().trim()
+              });
+            });
+            return;
+          }
         });
 
         return {
@@ -938,7 +955,7 @@ app.get('/erank/my-shop', async (_req, res) => {
         return issues;
       };
 
-      // F) Products activos (/listings/active)
+      // F) Products activos (/listings/active) con fallback bruto
       const getProducts = async () => {
         await openAndWait(page, `${BASE}/listings/active`, `${BASE}/dashboard`);
         await page.waitForTimeout(1000);
@@ -963,17 +980,44 @@ app.get('/erank/my-shop', async (_req, res) => {
 
         if (!items.length) {
           const html = await page.content();
-          const parsed = parseTopListingsHTML(html);
-          items = parsed.results || [];
-        }
+          const $ = cheerio.load(html);
 
-        const seen = new Set();
-        items = items.filter(it => {
-          const k = ((it.listing_id || '') + '|' + (it.href || '')).trim();
-          if (!k || seen.has(k)) return false;
-          seen.add(k);
-          return true;
-        });
+          const temp = [];
+
+          $('a[href*="/listing/"]').each((_, el) => {
+            const href  = ($(el).attr('href') || '').toString();
+            let title   = ($(el).text() || '').toString().trim();
+            if (!href) return;
+
+            const card = $(el).closest('tr, article, li, div');
+            if (!title && card.length) {
+              title = card.text().trim().slice(0, 120);
+            }
+
+            const m = href.match(/\/listing\/(\d{9,})/);
+            const listingId = m ? m[1] : '';
+
+            temp.push({
+              listing_id: listingId,
+              title,
+              href,
+              shop_id: '',
+              shop_name: '',
+              views: 0,
+              favorites: 0,
+              sales: 0,
+              score: 0
+            });
+          });
+
+          const seen = new Set();
+          items = temp.filter(it => {
+            const k = ((it.listing_id || '') + '|' + (it.href || '')).trim();
+            if (!k || seen.has(k)) return false;
+            seen.add(k);
+            return true;
+          });
+        }
 
         return items;
       };
@@ -1006,7 +1050,6 @@ app.get('/erank/my-shop', async (_req, res) => {
     res.status(500).json({ error: e.message || String(e) });
   }
 });
-
 
 /* ===========================
    DEBUG screenshots
