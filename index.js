@@ -534,7 +534,7 @@ async function getTopListings({ q, country, market, limit, period }){
   items = await enrichShops(pg, items);
   await pg.close();
 
-  const seen=newSet = new Set();
+  const seen=new Set();
   items = items.filter(r=>{
     const k=(r.listing_id||'')+'|'+(r.href||'');
     if (!r.listing_id && !r.href) return false;
@@ -766,111 +766,55 @@ app.get('/erank/my-shop', async (_req, res) => {
         return { topTags, tagReport };
       };
 
-      // C) Traffic Stats (/traffic-stats) — parser genérico sobre todas las tablas
+      // C) Traffic Stats (/traffic-stats/etsy) — Etsy Traffic table
       const getTrafficStats = async () => {
-        await openAndWait(page, `${BASE}/traffic-stats`, `${BASE}/dashboard`);
+        await openAndWait(page, `${BASE}/traffic-stats/etsy`, `${BASE}/dashboard`);
         await page.waitForTimeout(800);
         await autoScroll(page, 4);
 
         const html = await page.content();
         const $ = cheerio.load(html);
 
-        const topSources   = [];
-        const topKeywords  = [];
-        const topDevices   = [];
-        const topCities    = [];
-        const topCountries = [];
+        const tbl = tableByHeaders($, [
+          /keyword.*listing/i,
+          /visits/i
+        ]);
 
-        $('table').each((_, t) => {
-          const table = $(t);
+        const rows = [];
+        if (tbl) {
+          const h = tbl.header;
+          const iKW  = h.findIndex(x => /keyword.*listing/i.test(x));
+          const iVis = h.findIndex(x => /visit/i.test(x));
+          const iPos = h.findIndex(x => /position/i.test(x));
+          const iSrc = h.findIndex(x => /traffic.*source|source/i.test(x));
 
-          const headers = [];
-          table.find('thead th, tr th').each((__, th) =>
-            headers.push($(th).text().trim().toLowerCase())
-          );
-          if (!headers.length) return;
+          for (const r of tbl.rows) {
+            const keywordOrListing = (iKW >= 0 ? r[iKW] : '').toString().trim();
+            if (!keywordOrListing) continue;
+            const visits   = (iVis >= 0 ? r[iVis] : '').toString().trim();
+            const position = (iPos >= 0 ? r[iPos] : '').toString().trim();
+            const source   = (iSrc >= 0 ? r[iSrc] : '').toString().trim();
 
-          const has = (rx) => headers.some(h => rx.test(h));
-
-          const rows = [];
-          table.find('tbody tr').each((__, tr) => {
-            const tds = $(tr).find('td');
-            if (!tds.length) return;
-            rows.push(tds.map((___, td) => $(td).text().trim()).get());
-          });
-          if (!rows.length) return;
-
-          if (has(/source|referrer/)) {
-            const iSource = headers.findIndex(h => /source|referrer/.test(h));
-            const iVisits = headers.findIndex(h => /visit|session|traffic/.test(h));
-            rows.forEach(r => {
-              topSources.push({
-                source: (r[iSource] || '').toString().trim(),
-                visits: (r[iVisits] || '').toString().trim()
-              });
+            rows.push({
+              keywordOrListing,
+              visits,
+              position,
+              source
             });
-            return;
           }
-
-          if (has(/keyword|search term/)) {
-            const iKw = headers.findIndex(h => /keyword|search term/.test(h));
-            const iVis = headers.findIndex(h => /visit|click|session/.test(h));
-            rows.forEach(r => {
-              topKeywords.push({
-                keyword: (r[iKw] || '').toString().trim(),
-                visits: (r[iVis] || '').toString().trim()
-              });
-            });
-            return;
-          }
-
-          if (has(/device/)) {
-            const iDev = headers.findIndex(h => /device/.test(h));
-            const iVis = headers.findIndex(h => /visit|session|traffic/.test(h));
-            rows.forEach(r => {
-              topDevices.push({
-                device: (r[iDev] || '').toString().trim(),
-                visits: (r[iVis] || '').toString().trim()
-              });
-            });
-            return;
-          }
-
-          if (has(/city/)) {
-            const iCity = headers.findIndex(h => /city/.test(h));
-            const iVis  = headers.findIndex(h => /visit|session|traffic/.test(h));
-            rows.forEach(r => {
-              topCities.push({
-                city: (r[iCity] || '').toString().trim(),
-                visits: (r[iVis]  || '').toString().trim()
-              });
-            });
-            return;
-          }
-
-          if (has(/country/)) {
-            const iCountry = headers.findIndex(h => /country/.test(h));
-            const iVis     = headers.findIndex(h => /visit|session|traffic/.test(h));
-            rows.forEach(r => {
-              topCountries.push({
-                country: (r[iCountry] || '').toString().trim(),
-                visits: (r[iVis]     || '').toString().trim()
-              });
-            });
-            return;
-          }
-        });
+        }
 
         return {
-          topSources,
-          topKeywords,
-          topDevices,
-          topCities,
-          topCountries
+          rows,
+          topSources: [],
+          topKeywords: [],
+          topDevices: [],
+          topCities: [],
+          topCountries: []
         };
       };
 
-      // D) Spotted on Etsy (/spotted-on-etsy)
+      // D) Spotted on Etsy (/spotted-on-etsy) — Top Listings table
       const getSpotted = async () => {
         await openAndWait(page, `${BASE}/spotted-on-etsy`, `${BASE}/dashboard`);
         await page.waitForTimeout(800);
@@ -879,35 +823,46 @@ app.get('/erank/my-shop', async (_req, res) => {
         const html = await page.content();
         const $ = cheerio.load(html);
 
-        const tbl = tableByHeaders($, [/listing/i, /rank/i, /page/i]);
+        const tbl = tableByHeaders($, [
+          /shop.*listing/i,
+          /search\s*term/i,
+          /position/i
+        ]);
         if (!tbl) return [];
 
-        const idxListing = tbl.header.findIndex(h => /listing/.test(h));
-        const idxRank    = tbl.header.findIndex(h => /rank/.test(h));
-        const idxPage    = tbl.header.findIndex(h => /page/.test(h));
-        const idxPos     = tbl.header.findIndex(h => /position/.test(h));
-        const idxSearch  = tbl.header.findIndex(h => /searches/.test(h));
-        const idxWhen    = tbl.header.findIndex(h => /spotted|date/i.test(h));
-        const idxBy      = tbl.header.findIndex(h => /spotted.*by|by/i.test(h));
+        const h = tbl.header;
+        const iShop = h.findIndex(x => /shop.*listing/i.test(x));
+        const iTerm = h.findIndex(x => /search\s*term/i.test(x));
+        const iPage = h.findIndex(x => /page/i.test(x));
+        const iPos  = h.findIndex(x => /position/i.test(x));
+        const iRank = h.findIndex(x => /rank/i.test(x));
+        const iTs   = h.findIndex(x => /timestamp|date/i.test(x));
+        const iBy   = h.findIndex(x => /spotted.*by|by/i.test(x));
 
-        const spotted = tbl.rows.map(r => {
-          const listingText = (idxListing >= 0 ? r[idxListing] : '') || '';
-          const clean = listingText.toString().trim();
-          const m = clean.match(/(\d{9,})/);
-          const listingId = m ? m[1] : '';
-          return {
-            listingId,
-            title: clean,
-            rank: idxRank   >= 0 ? (r[idxRank]   || '').toString().trim() : '',
-            page: idxPage   >= 0 ? (r[idxPage]   || '').toString().trim() : '',
-            position: idxPos >= 0 ? (r[idxPos]   || '').toString().trim() : '',
-            searches: idxSearch >= 0 ? (r[idxSearch] || '').toString().trim() : '',
-            spottedAt: idxWhen >= 0 ? (r[idxWhen] || '').toString().trim() : '',
-            spottedBy: idxBy   >= 0 ? (r[idxBy]   || '').toString().trim() : ''
-          };
-        });
+        const out = [];
+        for (const r of tbl.rows) {
+          const shopListing = (iShop >= 0 ? r[iShop] : '').toString().trim();
+          if (!shopListing) continue;
+          const searchTerm  = (iTerm >= 0 ? r[iTerm] : '').toString().trim();
+          const pageTxt     = (iPage >= 0 ? r[iPage] : '').toString().trim();
+          const position    = (iPos  >= 0 ? r[iPos]  : '').toString().trim();
+          const rank        = (iRank >= 0 ? r[iRank] : '').toString().trim();
+          const timestamp   = (iTs   >= 0 ? r[iTs]   : '').toString().trim();
+          const spottedBy   = (iBy   >= 0 ? r[iBy]   : '').toString().trim();
 
-        return spotted;
+          out.push({
+            listingId: '', // eRank aquí no enseña el ID, solo el título
+            title: shopListing,
+            searchTerm,
+            page: pageTxt,
+            position,
+            rank,
+            timestamp,
+            spottedBy
+          });
+        }
+
+        return out;
       };
 
       // E) Spell Checker (/spell-checker)
@@ -937,9 +892,8 @@ app.get('/erank/my-shop', async (_req, res) => {
           const listings = listingsText
             ? listingsText.split(/[,;]/).map(s => {
                 const clean = s.toString().trim();
-                const m = clean.match(/(\d{9,})/);
                 return {
-                  listingId: m ? m[1] : '',
+                  listingId: '',
                   title: clean
                 };
               }).filter(Boolean)
@@ -955,73 +909,6 @@ app.get('/erank/my-shop', async (_req, res) => {
         return issues;
       };
 
-      // F) Products activos (/listings/active) con fallback bruto
-      const getProducts = async () => {
-        await openAndWait(page, `${BASE}/listings/active`, `${BASE}/dashboard`);
-        await page.waitForTimeout(1000);
-        await autoScroll(page, 4);
-
-        const cap = await captureJson(
-          page,
-          x => x && typeof x === 'object' &&
-            ('listing_id' in x || 'title' in x || 'url' in x),
-          5000
-        );
-
-        let items = [];
-        for (const h of cap) {
-          for (const arr of h.arrays) {
-            for (const o of arr) {
-              const n = normalizeListing(o);
-              if (n) items.push(n);
-            }
-          }
-        }
-
-        if (!items.length) {
-          const html = await page.content();
-          const $ = cheerio.load(html);
-
-          const temp = [];
-
-          $('a[href*="/listing/"]').each((_, el) => {
-            const href  = ($(el).attr('href') || '').toString();
-            let title   = ($(el).text() || '').toString().trim();
-            if (!href) return;
-
-            const card = $(el).closest('tr, article, li, div');
-            if (!title && card.length) {
-              title = card.text().trim().slice(0, 120);
-            }
-
-            const m = href.match(/\/listing\/(\d{9,})/);
-            const listingId = m ? m[1] : '';
-
-            temp.push({
-              listing_id: listingId,
-              title,
-              href,
-              shop_id: '',
-              shop_name: '',
-              views: 0,
-              favorites: 0,
-              sales: 0,
-              score: 0
-            });
-          });
-
-          const seen = new Set();
-          items = temp.filter(it => {
-            const k = ((it.listing_id || '') + '|' + (it.href || '')).trim();
-            if (!k || seen.has(k)) return false;
-            seen.add(k);
-            return true;
-          });
-        }
-
-        return items;
-      };
-
       /* ===== Ejecutamos todas las partes de MyShop ===== */
 
       const { kpis, recentListings } = await getDashboard();
@@ -1029,7 +916,9 @@ app.get('/erank/my-shop', async (_req, res) => {
       const trafficStats             = await getTrafficStats();
       const spottedOnEtsy            = await getSpotted();
       const spellingIssues           = await getSpellCheck();
-      const products                 = await getProducts();
+
+      // Para ti "productos" = los Top Listings de Spotted on Etsy
+      const products                 = spottedOnEtsy;
 
       await page.close();
 
