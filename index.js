@@ -587,18 +587,420 @@ app.get('/erank/top-products', async (req,res)=>{
 });
 
 /* ===========================
-   my-shop & stats
+   my-shop & stats (FULL MODE)
 =========================== */
-app.get('/erank/my-shop', async (_req,res)=>{
-  try{
-    await ensureBrowser(); const pg=await context.newPage(); await loginIfNeeded(pg);
-    await openAndWait(pg, `${BASE}/dashboard`, `${BASE}/`);
-    const html=await pg.content(); await pg.close();
-    const $=cheerio.load(html); const stats={};
-    $('[class*="stat"],[class*="metric"]').each((_,el)=>{ const t=$(el).text().trim().replace(/\s+/g,' '); if(!t) return; const p=t.split(':'); if(p.length>=2) stats[p[0].trim()]=p.slice(1).join(':').trim(); });
-    res.json({ stats });
-  }catch(e){ res.status(500).json({error:e.message}); }
+app.get('/erank/my-shop', async (_req, res) => {
+  try {
+    const out = await withRetries(async () => {
+      await ensureBrowser();
+      const page = await context.newPage();
+      await loginIfNeeded(page);
+
+      /* ===== Helpers locales para MyShop ===== */
+
+      const dedupeSimple = (arr) => {
+        const s = new Set();
+        return arr.filter(x => {
+          const key =
+            typeof x === 'string'
+              ? x.trim().toLowerCase()
+              : (x.title || x.tag || '').trim().toLowerCase();
+          if (!key || s.has(key)) return false;
+          s.add(key);
+          return true;
+        });
+      };
+
+      const extractSectionItems = ($, heading, { linkSelector, textSelector, max = 20 } = {}) => {
+        const normalizedHeading = heading.toLowerCase();
+
+        const headingNode = $('*')
+          .filter((_, el) => ($(el).text() || '').trim().toLowerCase().startsWith(normalizedHeading))
+          .first();
+        if (!headingNode.length) return [];
+
+        let container = headingNode.closest('section');
+        if (!container.length) container = headingNode.parent();
+
+        const items = [];
+
+        if (linkSelector) {
+          container.find(linkSelector).each((_, el) => {
+            const t = $(el).text().trim();
+            const href = $(el).attr('href') || '';
+            if (t && !t.toLowerCase().startsWith(normalizedHeading)) {
+              items.push({ title: t, href });
+            }
+          });
+        } else if (textSelector) {
+          container.find(textSelector).each((_, el) => {
+            const t = $(el).text().trim();
+            if (t && !t.toLowerCase().startsWith(normalizedHeading)) {
+              items.push(t);
+            }
+          });
+        }
+
+        if (!items.length) return [];
+        if (typeof items[0] === 'string') {
+          return dedupeSimple(items).slice(0, max);
+        }
+        const seen = new Set();
+        const out = [];
+        for (const it of items) {
+          const k = (it.title || '') + '|' + (it.href || '');
+          if (!k.trim() || seen.has(k)) continue;
+          seen.add(k);
+          out.push(it);
+          if (out.length >= max) break;
+        }
+        return out;
+      };
+
+      // A) Dashboard: KPIs + recentListings
+      const getDashboard = async () => {
+        await openAndWait(page, `${BASE}/dashboard`, `${BASE}/`);
+
+        const html = await page.content();
+        const $ = cheerio.load(html);
+
+        const bodyText = $('body').text().replace(/\s+/g, ' ');
+
+        const kpis = {};
+        const getNumberAfter = (label) => {
+          const re = new RegExp(label + '\\s*:?\\s*(\\d[\\d,]*)', 'i');
+          const m = bodyText.match(re);
+          return m ? m[1] : '';
+        };
+
+        kpis.sales          = getNumberAfter('Sales');
+        kpis.activeListings = getNumberAfter('Active Listings');
+        kpis.spottedOnEtsy  = getNumberAfter('Spotted on Etsy');
+
+        const mRankES = bodyText.match(/Sales Rank\s*[A-Z]{2}\s*(\d[\d,]*)/i);
+        kpis.salesRankES = mRankES ? mRankES[1] : '';
+
+        const mGlobal = bodyText.match(/(\d[\d,]*)\s*globally/i);
+        kpis.globalRank = mGlobal ? mGlobal[1] : '';
+
+        const recentListings = extractSectionItems($, 'Recent Listings', {
+          linkSelector: 'a[href*="/listing/"]',
+          max: 20
+        });
+
+        return { kpis, recentListings };
+      };
+
+      // B) Top Tags + Tag Report (/tags)
+      const getTagsReport = async () => {
+        const country = DEFAULT_COUNTRY;
+        await openAndWait(page, `${BASE}/tags?country=${encodeURIComponent(country)}`, `${BASE}/dashboard`);
+        await page.waitForTimeout(600);
+        await autoScroll(page, 4);
+
+        const cap = await captureJson(
+          page,
+          x => x && typeof x === 'object' && ('tag' in x),
+          2500
+        );
+
+        let tags = [];
+        for (const h of cap) {
+          for (const arr of h.arrays) {
+            for (const o of arr) {
+              const tag = (o.tag || '').toString().trim();
+              if (!tag) continue;
+              const avgSearches = normVal(o.avg_searches ?? o.searches ?? '');
+              const avgClicks   = normVal(o.avg_clicks ?? o.clicks ?? '');
+              const avgCTR      = normVal(o.avg_ctr ?? o.ctr ?? '');
+              const etsyComp    = normVal(o.etsy_competition ?? o.competition ?? '');
+              const trend       = (o.search_trend || o.trend || '').toString();
+              const gSearch     = normVal(o.google_searches ?? '');
+
+              tags.push({
+                tag,
+                avgSearches,
+                avgClicks,
+                avgCTR,
+                etsyCompetition: etsyComp,
+                googleSearches: gSearch,
+                searchTrend: trend
+              });
+            }
+          }
+        }
+
+        if (!tags.length) {
+          const html = await page.content();
+          const $ = cheerio.load(html);
+          const tbl = tableByHeaders($, [/^tag$/, /avg.*search|searches/, /competition|etsy/]);
+          if (tbl) {
+            const iTag  = tbl.header.findIndex(h => h === 'tag');
+            const iSrch = tbl.header.findIndex(h => /avg.*search|searches/.test(h));
+            const iComp = tbl.header.findIndex(h => /competition|etsy/.test(h));
+            tags = tbl.rows.map(r => {
+              const t = (r[iTag] || '').trim();
+              if (!t) return null;
+              const a = (iSrch >= 0 ? r[iSrch] : '').trim();
+              const c = (iComp >= 0 ? r[iComp] : '').trim();
+              return {
+                tag: t,
+                avgSearches: a,
+                avgClicks: '',
+                avgCTR: '',
+                etsyCompetition: c,
+                googleSearches: '',
+                searchTrend: ''
+              };
+            }).filter(Boolean);
+          }
+        }
+
+        tags = dedupeSimple(tags);
+        const topTags  = tags.slice(0, 20).map(t => t.tag);
+        const tagReport = tags;
+
+        return { topTags, tagReport };
+      };
+
+      // C) Traffic Stats (/traffic-stats)
+      const getTrafficStats = async () => {
+        await openAndWait(page, `${BASE}/traffic-stats`, `${BASE}/dashboard`);
+        await page.waitForTimeout(800);
+        await autoScroll(page, 4);
+
+        const html = await page.content();
+        const $ = cheerio.load(html);
+
+        const parseSectionTable = (headingRegex, colMap) => {
+          const headingNode = $('*')
+            .filter((_, el) => headingRegex.test(($(el).text() || '').trim()))
+            .first();
+          if (!headingNode.length) return [];
+
+          let container = headingNode.closest('section');
+          if (!container.length) container = headingNode.parent();
+
+          const table = container.find('table').first();
+          if (!table.length) return [];
+
+          const headers = [];
+          table.find('thead th, tr th').each((_, th) =>
+            headers.push($(th).text().trim().toLowerCase())
+          );
+          if (!headers.length) return [];
+
+          const getIndex = (regex) =>
+            headers.findIndex(h => regex.test(h));
+
+          const idx = {};
+          for (const [key, regex] of Object.entries(colMap)) {
+            idx[key] = getIndex(regex);
+          }
+
+          const rows = [];
+          table.find('tbody tr').each((_, tr) => {
+            const tds = $(tr).find('td');
+            if (!tds.length) return;
+            const row = {};
+            for (const [key, i] of Object.entries(idx)) {
+              if (i >= 0 && i < tds.length) {
+                row[key] = $(tds[i]).text().trim();
+              } else {
+                row[key] = '';
+              }
+            }
+            rows.push(row);
+          });
+          return rows;
+        };
+
+        const topSources = parseSectionTable(/top\s+sources/i, {
+          source: /source|referrer/i,
+          visits: /visits|sessions|traffic/i
+        });
+
+        const topKeywords = parseSectionTable(/top\s+keywords/i, {
+          keyword: /keyword|search term/i,
+          visits: /visits|clicks|sessions/i
+        });
+
+        const topDevices = parseSectionTable(/top\s+devices/i, {
+          device: /device/i,
+          visits: /visits|sessions|traffic/i
+        });
+
+        const topCities = parseSectionTable(/top\s+cities/i, {
+          city: /city/i,
+          visits: /visits|sessions|traffic/i
+        });
+
+        const topCountries = parseSectionTable(/top\s+countries/i, {
+          country: /country/i,
+          visits: /visits|sessions|traffic/i
+        });
+
+        return {
+          topSources,
+          topKeywords,
+          topDevices,
+          topCities,
+          topCountries
+        };
+      };
+
+      // D) Spotted on Etsy (/spotted-on-etsy)
+      const getSpotted = async () => {
+        await openAndWait(page, `${BASE}/spotted-on-etsy`, `${BASE}/dashboard`);
+        await page.waitForTimeout(800);
+        await autoScroll(page, 2);
+
+        const html = await page.content();
+        const $ = cheerio.load(html);
+
+        const tbl = tableByHeaders($, [/listing/i, /rank/i, /page/i]);
+        if (!tbl) return [];
+
+        const idxListing = tbl.header.findIndex(h => /listing/.test(h));
+        const idxRank    = tbl.header.findIndex(h => /rank/.test(h));
+        const idxPage    = tbl.header.findIndex(h => /page/.test(h));
+        const idxPos     = tbl.header.findIndex(h => /position/.test(h));
+        const idxSearch  = tbl.header.findIndex(h => /searches/.test(h));
+        const idxWhen    = tbl.header.findIndex(h => /spotted|date/i.test(h));
+        const idxBy      = tbl.header.findIndex(h => /spotted.*by|by/i.test(h));
+
+        const spotted = tbl.rows.map(r => {
+          const listingText = (idxListing >= 0 ? r[idxListing] : '').trim();
+          const m = listingText.match(/(\d{9,})/);
+          const listingId = m ? m[1] : '';
+          return {
+            listingId,
+            title: listingText,
+            rank: idxRank   >= 0 ? r[idxRank].trim()    : '',
+            page: idxPage   >= 0 ? r[idxPage].trim()    : '',
+            position: idxPos >= 0 ? r[idxPos].trim()    : '',
+            searches: idxSearch >= 0 ? r[idxSearch].trim() : '',
+            spottedAt: idxWhen >= 0 ? r[idxWhen].trim() : '',
+            spottedBy: idxBy   >= 0 ? r[idxBy].trim()   : ''
+          };
+        });
+
+        return spotted;
+      };
+
+      // E) Spell Checker (/spell-checker)
+      const getSpellCheck = async () => {
+        await openAndWait(page, `${BASE}/spell-checker`, `${BASE}/dashboard`);
+        await page.waitForTimeout(800);
+
+        const html = await page.content();
+        const $ = cheerio.load(html);
+
+        const tbl = tableByHeaders($, [/tag/i, /suggest/i, /listing/i]);
+        if (!tbl) return [];
+
+        const iWrong = tbl.header.findIndex(h => /tag|keyword/i.test(h));
+        const iSugg  = tbl.header.findIndex(h => /suggest/i.test(h));
+        const iList  = tbl.header.findIndex(h => /listing/i.test(h));
+
+        const issues = tbl.rows.map(r => {
+          const wrong = (iWrong >= 0 ? r[iWrong] : '').trim();
+          const suggsText = (iSugg >= 0 ? r[iSugg] : '').trim();
+          const listingsText = (iList >= 0 ? r[iList] : '').trim();
+
+          const suggestions = suggsText
+            ? suggsText.split(/[,;]/).map(s => s.trim()).filter(Boolean)
+            : [];
+
+          const listings = listingsText
+            ? listingsText.split(/[,;]/).map(s => {
+                const m = s.match(/(\d{9,})/);
+                return {
+                  listingId: m ? m[1] : '',
+                  title: s.trim()
+                };
+              }).filter(Boolean)
+            : [];
+
+          return {
+            wrongTag: wrong,
+            suggestions,
+            listings
+          };
+        });
+
+        return issues;
+      };
+
+      // F) Products activos (/listings/active)
+      const getProducts = async () => {
+        await openAndWait(page, `${BASE}/listings/active`, `${BASE}/dashboard`);
+        await page.waitForTimeout(1000);
+        await autoScroll(page, 4);
+
+        const cap = await captureJson(
+          page,
+          x => x && typeof x === 'object' &&
+            ('listing_id' in x || 'title' in x || 'url' in x),
+          5000
+        );
+
+        let items = [];
+        for (const h of cap) {
+          for (const arr of h.arrays) {
+            for (const o of arr) {
+              const n = normalizeListing(o);
+              if (n) items.push(n);
+            }
+          }
+        }
+
+        if (!items.length) {
+          const html = await page.content();
+          const parsed = parseTopListingsHTML(html);
+          items = parsed.results || [];
+        }
+
+        const seen = new Set();
+        items = items.filter(it => {
+          const k = (it.listing_id || '') + '|' + (it.href || '');
+          if (!k.trim() || seen.has(k)) return false;
+          seen.add(k);
+          return true;
+        });
+
+        return items;
+      };
+
+      /* ===== Ejecutamos todas las partes de MyShop ===== */
+
+      const { kpis, recentListings } = await getDashboard();
+      const { topTags, tagReport }   = await getTagsReport();
+      const trafficStats             = await getTrafficStats();
+      const spottedOnEtsy            = await getSpotted();
+      const spellingIssues           = await getSpellCheck();
+      const products                 = await getProducts();
+
+      await page.close();
+
+      return {
+        kpis,
+        topTags,
+        trafficStats,
+        spottedOnEtsy,
+        recentListings,
+        spellingIssues,
+        products,
+        tagReport
+      };
+    }, 'my-shop-full');
+
+    res.json(out);
+  } catch (e) {
+    res.status(500).json({ error: e.message || String(e) });
+  }
 });
+
 app.get('/erank/stats', async (_req,res)=>{
   try{ await ensureBrowser(); const pg=await context.newPage(); await loginIfNeeded(pg);
     await openAndWait(pg, `${BASE}/dashboard`, `${BASE}/`); const html=await pg.content(); await pg.close();
