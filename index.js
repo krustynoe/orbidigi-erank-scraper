@@ -601,10 +601,12 @@ app.get('/erank/my-shop', async (_req, res) => {
       const dedupeSimple = (arr) => {
         const s = new Set();
         return arr.filter(x => {
-          const key =
+          // normalizamos a string de forma segura
+          const raw =
             typeof x === 'string'
-              ? x.trim().toLowerCase()
-              : (x.title || x.tag || '').trim().toLowerCase();
+              ? x
+              : (x && (x.title || x.tag || '')) || '';
+          const key = raw.toString().trim().toLowerCase();
           if (!key || s.has(key)) return false;
           s.add(key);
           return true;
@@ -626,7 +628,7 @@ app.get('/erank/my-shop', async (_req, res) => {
 
         if (linkSelector) {
           container.find(linkSelector).each((_, el) => {
-            const t = $(el).text().trim();
+            const t = ($(el).text() || '').trim();
             const href = $(el).attr('href') || '';
             if (t && !t.toLowerCase().startsWith(normalizedHeading)) {
               items.push({ title: t, href });
@@ -634,7 +636,7 @@ app.get('/erank/my-shop', async (_req, res) => {
           });
         } else if (textSelector) {
           container.find(textSelector).each((_, el) => {
-            const t = $(el).text().trim();
+            const t = ($(el).text() || '').trim();
             if (t && !t.toLowerCase().startsWith(normalizedHeading)) {
               items.push(t);
             }
@@ -648,10 +650,12 @@ app.get('/erank/my-shop', async (_req, res) => {
         const seen = new Set();
         const out = [];
         for (const it of items) {
-          const k = (it.title || '') + '|' + (it.href || '');
-          if (!k.trim() || seen.has(k)) continue;
+          const title = (it.title || '').toString();
+          const href  = (it.href  || '').toString();
+          const k = (title + '|' + href).trim();
+          if (!k || seen.has(k)) continue;
           seen.add(k);
-          out.push(it);
+          out.push({ title, href });
           if (out.length >= max) break;
         }
         return out;
@@ -870,18 +874,19 @@ app.get('/erank/my-shop', async (_req, res) => {
         const idxBy      = tbl.header.findIndex(h => /spotted.*by|by/i.test(h));
 
         const spotted = tbl.rows.map(r => {
-          const listingText = (idxListing >= 0 ? r[idxListing] : '').trim();
-          const m = listingText.match(/(\d{9,})/);
+          const listingText = (idxListing >= 0 ? r[idxListing] : '') || '';
+          const clean = listingText.toString().trim();
+          const m = clean.match(/(\d{9,})/);
           const listingId = m ? m[1] : '';
           return {
             listingId,
-            title: listingText,
-            rank: idxRank   >= 0 ? r[idxRank].trim()    : '',
-            page: idxPage   >= 0 ? r[idxPage].trim()    : '',
-            position: idxPos >= 0 ? r[idxPos].trim()    : '',
-            searches: idxSearch >= 0 ? r[idxSearch].trim() : '',
-            spottedAt: idxWhen >= 0 ? r[idxWhen].trim() : '',
-            spottedBy: idxBy   >= 0 ? r[idxBy].trim()   : ''
+            title: clean,
+            rank: idxRank   >= 0 ? (r[idxRank]   || '').toString().trim() : '',
+            page: idxPage   >= 0 ? (r[idxPage]   || '').toString().trim() : '',
+            position: idxPos >= 0 ? (r[idxPos]   || '').toString().trim() : '',
+            searches: idxSearch >= 0 ? (r[idxSearch] || '').toString().trim() : '',
+            spottedAt: idxWhen >= 0 ? (r[idxWhen] || '').toString().trim() : '',
+            spottedBy: idxBy   >= 0 ? (r[idxBy]   || '').toString().trim() : ''
           };
         });
 
@@ -904,9 +909,9 @@ app.get('/erank/my-shop', async (_req, res) => {
         const iList  = tbl.header.findIndex(h => /listing/i.test(h));
 
         const issues = tbl.rows.map(r => {
-          const wrong = (iWrong >= 0 ? r[iWrong] : '').trim();
-          const suggsText = (iSugg >= 0 ? r[iSugg] : '').trim();
-          const listingsText = (iList >= 0 ? r[iList] : '').trim();
+          const wrong      = iWrong >= 0 ? (r[iWrong] || '').toString().trim() : '';
+          const suggsText  = iSugg  >= 0 ? (r[iSugg]  || '').toString().trim() : '';
+          const listingsText = iList >= 0 ? (r[iList] || '').toString().trim() : '';
 
           const suggestions = suggsText
             ? suggsText.split(/[,;]/).map(s => s.trim()).filter(Boolean)
@@ -914,10 +919,11 @@ app.get('/erank/my-shop', async (_req, res) => {
 
           const listings = listingsText
             ? listingsText.split(/[,;]/).map(s => {
-                const m = s.match(/(\d{9,})/);
+                const clean = s.toString().trim();
+                const m = clean.match(/(\d{9,})/);
                 return {
                   listingId: m ? m[1] : '',
-                  title: s.trim()
+                  title: clean
                 };
               }).filter(Boolean)
             : [];
@@ -963,8 +969,8 @@ app.get('/erank/my-shop', async (_req, res) => {
 
         const seen = new Set();
         items = items.filter(it => {
-          const k = (it.listing_id || '') + '|' + (it.href || '');
-          if (!k.trim() || seen.has(k)) return false;
+          const k = ((it.listing_id || '') + '|' + (it.href || '')).trim();
+          if (!k || seen.has(k)) return false;
           seen.add(k);
           return true;
         });
@@ -1001,12 +1007,6 @@ app.get('/erank/my-shop', async (_req, res) => {
   }
 });
 
-app.get('/erank/stats', async (_req,res)=>{
-  try{ await ensureBrowser(); const pg=await context.newPage(); await loginIfNeeded(pg);
-    await openAndWait(pg, `${BASE}/dashboard`, `${BASE}/`); const html=await pg.content(); await pg.close();
-    res.json({ ok:true, htmlLength:(html?.length||0), totalKeywords:(html?.match(/keyword/gi)||[]).length });
-  }catch(e){ res.status(409).json({error:e.message}); }
-});
 
 /* ===========================
    DEBUG screenshots
