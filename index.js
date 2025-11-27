@@ -160,7 +160,7 @@ async function withRetries(fn, label='task'){
   throw last;
 }
 
-/* ===== callErankJson (ya no se usa para trend-buzz, lo dejamos para debug) ===== */
+/* ===== callErankJson (para endpoints /api/...) ===== */
 async function callErankJson(apiPath) {
   await ensureBrowser();
   const page = await context.newPage();
@@ -374,6 +374,72 @@ function parseTrendBuzzHTML(html) {
     .filter(Boolean);
 
   return { count: results.length, results, header: h };
+}
+
+/* ===== Monthly trending-report JSON parser (via /api/trending-report) ===== */
+function parseTrendingReportJSON(json) {
+  if (!json || typeof json !== 'object') {
+    return { count: 0, results: [] };
+  }
+  // Buscamos arrays profundas que contengan objetos con campos tipo term/keyword/search_term
+  const arrays = findArraysDeep(json, x =>
+    x && typeof x === 'object' &&
+    ('term' in x || 'keyword' in x || 'search_term' in x)
+  );
+  const rows = [];
+  for (const arr of arrays) {
+    for (const o of arr) {
+      if (!o || typeof o !== 'object') continue;
+      const term =
+        (o.term ||
+         o.keyword ||
+         o.search_term ||
+         o.searchTerm ||
+         '').toString().trim();
+      if (!term) continue;
+
+      const thisMonth = normVal(
+        o.this_month ||
+        o.thisMonth ||
+        o.current_month ||
+        o.current ||
+        ''
+      );
+      const lastMonth = normVal(
+        o.last_month ||
+        o.lastMonth ||
+        o.previous_month ||
+        o.previous ||
+        ''
+      );
+      const change = normVal(
+        o.change ||
+        o.diff ||
+        o.change_percent ||
+        o.delta ||
+        ''
+      );
+      const searches = normVal(
+        o.searches ||
+        o.volume ||
+        o.avg_searches ||
+        o.total_searches ||
+        ''
+      );
+
+      rows.push({ term, thisMonth, lastMonth, change, searches });
+    }
+  }
+
+  // Dedupe por term
+  const seen = new Set();
+  const results = rows.filter(r => {
+    const k = (r.term || '').toLowerCase();
+    if (!k || seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  return { count: results.length, results };
 }
 
 /* ===== Monthly trending-report HTML parser ===== */
@@ -949,9 +1015,6 @@ app.get('/erank/trend-buzz', async (req, res) => {
     // 1) Abrir Trend Buzz
     await openAndWait(page, `${BASE}/trend-buzz`, `${BASE}/dashboard`);
 
-    // (Opcional) si quieres replicar marketplace/país, puedes reusar ensureMarketplaceCountry aquí
-    // await ensureMarketplaceCountry(page, marketplace, country);
-
     // 2) Ajustar timeframe según "period" (solo si quieres; por defecto: Past 30 Days)
     try {
       const periodMap = {
@@ -1024,13 +1087,14 @@ app.get('/erank/trend-buzz', async (req, res) => {
 
 
 /* ===========================
-   /erank/monthly-trends (HTML scraping)
+   /erank/monthly-trends (API + HTML fallback)
+   → Usa primero /api/trending-report y si no devuelve nada, /trending-report HTML
 =========================== */
 app.get('/erank/monthly-trends', async (req, res) => {
   const marketplace = (req.query.marketplace || DEFAULT_MARKET).toLowerCase();
   const period      = (req.query.period || 'monthly').toString();
   const category    = (req.query.category || 'all').toString();
-  const date        = (req.query.date || '').toString();
+  const date        = (req.query.date || '').toString();      // YYYYMM
   const limitRaw    = parseInt(req.query.limit || '100', 10);
   const limit       = Math.max(1, Math.min(500, limitRaw || 100));
 
@@ -1039,25 +1103,49 @@ app.get('/erank/monthly-trends', async (req, res) => {
   }
 
   try {
-    await ensureBrowser();
-    const page = await context.newPage();
-    await loginIfNeeded(page);
+    // 1) Intentamos primero el endpoint JSON real:
+    //    /api/trending-report?category=all&date=202510&limit=100&marketplace=etsy&period=monthly
+    const apiPath =
+      `/api/trending-report?category=${encodeURIComponent(category)}` +
+      `&date=${encodeURIComponent(date)}` +
+      `&limit=${encodeURIComponent(String(limit))}` +
+      `&marketplace=${encodeURIComponent(marketplace)}` +
+      `&period=${encodeURIComponent(period)}`;
 
-    // Construimos la URL igual que en el navegador
-    const url = new URL(`${BASE}/trending-report`);
-    url.searchParams.set('marketplace', marketplace);
-    url.searchParams.set('period', period);
-    url.searchParams.set('category', category);
-    url.searchParams.set('date', date);
-    url.searchParams.set('limit', String(limit));
+    let parsed;
+    try {
+      const json = await callErankJson(apiPath);
+      parsed = parseTrendingReportJSON(json);
+    } catch (e) {
+      console.warn('monthly-trends JSON failed, falling back to HTML:', e.message || e);
+    }
 
-    await openAndWait(page, url.toString(), `${BASE}/dashboard`);
-    await autoScroll(page, 3);
+    // 2) Fallback HTML a /trending-report si el JSON no devuelve nada usable
+    if (!parsed || !parsed.results || !parsed.results.length) {
+      await ensureBrowser();
+      const page = await context.newPage();
+      await loginIfNeeded(page);
 
-    const html = await page.content();
-    await page.close();
+      const url = new URL(`${BASE}/trending-report`);
+      url.searchParams.set('marketplace', marketplace);
+      url.searchParams.set('period', period);
+      url.searchParams.set('category', category);
+      url.searchParams.set('date', date);
+      url.searchParams.set('limit', String(limit));
 
-    const parsed = parseTrendingReportHTML(html);
+      await openAndWait(page, url.toString(), `${BASE}/dashboard`);
+      await autoScroll(page, 3);
+
+      const html = await page.content();
+      await page.close();
+
+      parsed = parseTrendingReportHTML(html);
+    }
+
+    let results = parsed.results || [];
+    if (results.length > limit) {
+      results = results.slice(0, limit);
+    }
 
     res.json({
       marketplace,
@@ -1065,12 +1153,12 @@ app.get('/erank/monthly-trends', async (req, res) => {
       category,
       date,
       limit,
-      count: parsed.count,
-      results: parsed.results
+      count: results.length,
+      results
     });
 
   } catch (e) {
-    console.error('monthly-trends HTML error:', e);
+    console.error('monthly-trends error:', e);
     res.status(500).json({ error: e.message || String(e) });
   }
 });
