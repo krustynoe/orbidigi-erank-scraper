@@ -160,7 +160,7 @@ async function withRetries(fn, label='task'){
   throw last;
 }
 
-/* ===== callErankJson (para endpoints /api/...) ===== */
+/* ===== callErankJson (por si en el futuro usamos otros /api/...) ===== */
 async function callErankJson(apiPath) {
   await ensureBrowser();
   const page = await context.newPage();
@@ -306,13 +306,10 @@ function parseTopListingsHTML(html){
   return {count:items.length, results:items.filter(Boolean), htmlLength:(html?.length||0)};
 }
 
-/* ===== Trend Buzz HTML parser (NUEVO ROBUSTO) ===== */
+/* ===== Trend Buzz HTML parser (robusto) ===== */
 function parseTrendBuzzHTML(html) {
   const $ = cheerio.load(html);
 
-  // Intenta localizar una tabla con al menos 2 columnas.
-  // Primero probamos con cabeceras que contengan algo tipo keyword/color/product/recipient/style/material,
-  // pero si no encontramos nada, cogemos la primera tabla con >=2 th.
   let tbl = tableByHeaders($, [
     /(keyword|color|product|recipient|style|material)/i,
     /search\s*trend|trend|volume|search/i
@@ -349,11 +346,9 @@ function parseTrendBuzzHTML(html) {
 
   const h = tbl.header;
 
-  // Por defecto: primera columna = término, segunda columna = valor/tendencia.
   let iTerm = 0;
   let iTrend = h.length > 1 ? 1 : 0;
 
-  // Si detectamos alguna cabecera más específica, la usamos.
   const idxTerm = h.findIndex(x =>
     /(keyword|color|product|recipient|style|material)/i.test(x)
   );
@@ -376,12 +371,11 @@ function parseTrendBuzzHTML(html) {
   return { count: results.length, results, header: h };
 }
 
-/* ===== Monthly trending-report JSON parser (via /api/trending-report) ===== */
+/* ===== Monthly trending-report JSON parser (via XHR) ===== */
 function parseTrendingReportJSON(json) {
   if (!json || typeof json !== 'object') {
     return { count: 0, results: [] };
   }
-  // Buscamos arrays profundas que contengan objetos con campos tipo term/keyword/search_term
   const arrays = findArraysDeep(json, x =>
     x && typeof x === 'object' &&
     ('term' in x || 'keyword' in x || 'search_term' in x)
@@ -431,7 +425,6 @@ function parseTrendingReportJSON(json) {
     }
   }
 
-  // Dedupe por term
   const seen = new Set();
   const results = rows.filter(r => {
     const k = (r.term || '').toLowerCase();
@@ -628,7 +621,7 @@ app.get('/erank/raw', async (req,res)=>{
 });
 
 /* ===========================
-   KEYWORDS (TOP N) — robust
+   KEYWORDS (TOP N)
 =========================== */
 async function readStatsPanel(page){
   try{
@@ -658,7 +651,6 @@ app.get('/erank/keywords', async (req,res)=>{
       await ensureMarketplaceCountry(pg, market, country);
       await typeAndSearch(pg, q);
 
-      // Keyword Ideas → XHR
       await openTab(pg, 'Keyword Ideas');
       for(let i=0;i<2;i++){
         await pg.waitForResponse(
@@ -677,7 +669,6 @@ app.get('/erank/keywords', async (req,res)=>{
             if(nk) items.push(nk);
           }
 
-      // Panel de stats si no hay XHR
       if (!items.length){
         const s = await readStatsPanel(pg);
         if (s.avgSearches){
@@ -690,7 +681,6 @@ app.get('/erank/keywords', async (req,res)=>{
         }
       }
 
-      // Near Matches si faltan
       if (items.length < limit){
         await openTab(pg, 'Near Matches');
         await pg.waitForResponse(
@@ -707,7 +697,6 @@ app.get('/erank/keywords', async (req,res)=>{
             }
       }
 
-      // Fallback HTML
       if (!items.length){
         await pg.waitForSelector('table tbody tr td, [data-keyword], .ant-empty',{timeout:5000}).catch(()=>{});
         const html=await pg.content();
@@ -751,7 +740,7 @@ app.get('/erank/keywords', async (req,res)=>{
 
 
 /* ===========================
-   TAGS (TOP N) — robust
+   TAGS (TOP N)
 =========================== */
 app.get('/erank/tags', async (req,res)=>{
   const limit  = Math.max(1,Math.min(200, parseInt(req.query.limit||DEFAULT_TAG_N,10)));
@@ -781,7 +770,6 @@ app.get('/erank/tags', async (req,res)=>{
           rows.push({ tag, avg_searches:a, etsy_competition:c, score:score(a,c) });
         }
 
-    // Fallback HTML si no hay XHR
     if (!rows.length){
       rows = await pg.evaluate(()=>{
         const out=[]; 
@@ -846,7 +834,7 @@ app.get('/erank/tags', async (req,res)=>{
 
 
 /* ===========================
-   TOP LISTINGS — reusable & robust
+   TOP LISTINGS
 =========================== */
 async function getTopListings({ q, country, market, limit, period }){
   await ensureBrowser();
@@ -904,10 +892,6 @@ async function getTopListings({ q, country, market, limit, period }){
   return items.slice(0, limit);
 }
 
-
-/* ===========================
-   /erank/top-listings
-=========================== */
 app.get('/erank/top-listings', async (req,res)=>{
   const q=(req.query.q||'').toString().trim();
   if(!q) return res.status(400).json({error:'Missing ?q='});
@@ -930,7 +914,7 @@ app.get('/erank/top-listings', async (req,res)=>{
 
 
 /* ===========================
-   /erank/top-products (nuevo sorter)
+   TOP PRODUCTS (sorters)
 =========================== */
 app.get('/erank/top-products', async (req,res)=>{
   const q=(req.query.q||'').toString().trim();
@@ -981,7 +965,7 @@ app.get('/erank/top-products', async (req,res)=>{
 
 
 /* ===========================
-   /erank/trend-buzz (HTML scraping robusto)
+   TREND BUZZ
 =========================== */
 app.get('/erank/trend-buzz', async (req, res) => {
   const marketplace = (req.query.marketplace || DEFAULT_MARKET).toLowerCase();
@@ -989,7 +973,6 @@ app.get('/erank/trend-buzz', async (req, res) => {
   const period      = (req.query.period || 'thirty').toString();
   const categoryRaw = (req.query.category || 'Keyword').toString();
 
-  // Mapa de categoría lógica → nombre del tab en la UI
   const cat = categoryRaw.toLowerCase();
   const tabNameMap = {
     keyword:   'Keywords',
@@ -1012,10 +995,8 @@ app.get('/erank/trend-buzz', async (req, res) => {
     const page = await context.newPage();
     await loginIfNeeded(page);
 
-    // 1) Abrir Trend Buzz
     await openAndWait(page, `${BASE}/trend-buzz`, `${BASE}/dashboard`);
 
-    // 2) Ajustar timeframe según "period" (solo si quieres; por defecto: Past 30 Days)
     try {
       const periodMap = {
         thirty: /past\s*30\s*days/i,
@@ -1034,7 +1015,6 @@ app.get('/erank/trend-buzz', async (req, res) => {
       console.warn('trend-buzz period switch failed:', e.message || e);
     }
 
-    // 3) Clic en el TAB correcto (Keywords / Colors / Products / Recipients / Styles / Materials)
     let clicked = false;
     try {
       const tab = page.getByRole('tab', { name: new RegExp(`^${tabName}$`, 'i') });
@@ -1048,7 +1028,6 @@ app.get('/erank/trend-buzz', async (req, res) => {
       console.warn('trend-buzz tab click via role failed:', e.message || e);
     }
 
-    // Fallback: buscar por texto si el rol "tab" no funciona
     if (!clicked) {
       const loc = page.locator(`text=${tabName}`);
       if (await loc.first().isVisible().catch(() => false)) {
@@ -1060,11 +1039,9 @@ app.get('/erank/trend-buzz', async (req, res) => {
       }
     }
 
-    // 4) Esperar a que aparezca alguna tabla
     await page.waitForSelector('table', { timeout: 8000 }).catch(() => {});
     await autoScroll(page, 3);
 
-    // 5) HTML + parseo
     const html = await page.content();
     await page.close();
 
@@ -1087,8 +1064,8 @@ app.get('/erank/trend-buzz', async (req, res) => {
 
 
 /* ===========================
-   /erank/monthly-trends (API + HTML fallback)
-   → Usa primero /api/trending-report y si no devuelve nada, /trending-report HTML
+   MONTHLY TRENDS
+   (captura XHR /api/trending-report desde la UI + fallback HTML)
 =========================== */
 app.get('/erank/monthly-trends', async (req, res) => {
   const marketplace = (req.query.marketplace || DEFAULT_MARKET).toLowerCase();
@@ -1103,44 +1080,39 @@ app.get('/erank/monthly-trends', async (req, res) => {
   }
 
   try {
-    // 1) Intentamos primero el endpoint JSON real:
-    //    /api/trending-report?category=all&date=202510&limit=100&marketplace=etsy&period=monthly
-    const apiPath =
-      `/api/trending-report?category=${encodeURIComponent(category)}` +
-      `&date=${encodeURIComponent(date)}` +
-      `&limit=${encodeURIComponent(String(limit))}` +
-      `&marketplace=${encodeURIComponent(marketplace)}` +
-      `&period=${encodeURIComponent(period)}`;
+    await ensureBrowser();
+    const page = await context.newPage();
+    await loginIfNeeded(page);
 
-    let parsed;
-    try {
-      const json = await callErankJson(apiPath);
-      parsed = parseTrendingReportJSON(json);
-    } catch (e) {
-      console.warn('monthly-trends JSON failed, falling back to HTML:', e.message || e);
+    const uiUrl = new URL(`${BASE}/trending-report`);
+    uiUrl.searchParams.set('category', category);
+    uiUrl.searchParams.set('date', date);
+    uiUrl.searchParams.set('limit', String(limit));
+    uiUrl.searchParams.set('marketplace', marketplace);
+    uiUrl.searchParams.set('period', period);
+
+    await openAndWait(page, uiUrl.toString(), `${BASE}/dashboard`);
+    await autoScroll(page, 3);
+
+    const cap = await captureJson(
+      page,
+      x => x && typeof x === 'object' &&
+           ('term' in x || 'keyword' in x || 'search_term' in x),
+      5000
+    );
+
+    let parsed = { count: 0, results: [] };
+
+    if (cap.length) {
+      parsed = parseTrendingReportJSON(cap[0].json);
     }
 
-    // 2) Fallback HTML a /trending-report si el JSON no devuelve nada usable
     if (!parsed || !parsed.results || !parsed.results.length) {
-      await ensureBrowser();
-      const page = await context.newPage();
-      await loginIfNeeded(page);
-
-      const url = new URL(`${BASE}/trending-report`);
-      url.searchParams.set('marketplace', marketplace);
-      url.searchParams.set('period', period);
-      url.searchParams.set('category', category);
-      url.searchParams.set('date', date);
-      url.searchParams.set('limit', String(limit));
-
-      await openAndWait(page, url.toString(), `${BASE}/dashboard`);
-      await autoScroll(page, 3);
-
       const html = await page.content();
-      await page.close();
-
       parsed = parseTrendingReportHTML(html);
     }
+
+    await page.close();
 
     let results = parsed.results || [];
     if (results.length > limit) {
@@ -1165,7 +1137,7 @@ app.get('/erank/monthly-trends', async (req, res) => {
 
 
 /* ===========================
-   my-shop & stats (FULL MODE)
+   MY SHOP (FULL)
 =========================== */
 app.get('/erank/my-shop', async (_req, res) => {
   try {
@@ -1173,8 +1145,6 @@ app.get('/erank/my-shop', async (_req, res) => {
       await ensureBrowser();
       const page = await context.newPage();
       await loginIfNeeded(page);
-
-      /* ===== Helpers locales para MyShop ===== */
 
       const dedupeSimple = (arr) => {
         const s = new Set();
@@ -1238,7 +1208,6 @@ app.get('/erank/my-shop', async (_req, res) => {
         return out;
       };
 
-      // A) Dashboard: KPIs + recentListings
       const getDashboard = async () => {
         await openAndWait(page, `${BASE}/dashboard`, `${BASE}/`);
 
@@ -1272,7 +1241,6 @@ app.get('/erank/my-shop', async (_req, res) => {
         return { kpis, recentListings };
       };
 
-      // B) Top Tags + Tag Report (/tags)
       const getTagsReport = async () => {
         const country = DEFAULT_COUNTRY;
         await openAndWait(page, `${BASE}/tags?country=${encodeURIComponent(country)}`, `${BASE}/dashboard`);
@@ -1311,10 +1279,10 @@ app.get('/erank/my-shop', async (_req, res) => {
           }
         }
 
+        const $html = cheerio.load(await page.content());
+
         if (!tags.length) {
-          const html = await page.content();
-          const $ = cheerio.load(html);
-          const tbl = tableByHeaders($, [/^tag$/, /avg.*search|searches/, /competition|etsy/]);
+          const tbl = tableByHeaders($html, [/^tag$/, /avg.*search|searches/, /competition|etsy/]);
           if (tbl) {
             const iTag  = tbl.header.findIndex(h => h === 'tag');
             const iSrch = tbl.header.findIndex(h => /avg.*search|searches/.test(h));
@@ -1344,7 +1312,6 @@ app.get('/erank/my-shop', async (_req, res) => {
         return { topTags, tagReport };
       };
 
-      // C) Traffic Stats (/traffic-stats/etsy)
       const getTrafficStats = async () => {
         await openAndWait(page, `${BASE}/traffic-stats/etsy`, `${BASE}/dashboard`);
         await page.waitForTimeout(800);
@@ -1392,7 +1359,6 @@ app.get('/erank/my-shop', async (_req, res) => {
         };
       };
 
-      // D) Spotted on Etsy (/spotted-on-etsy)
       const getSpotted = async () => {
         await openAndWait(page, `${BASE}/spotted-on-etsy`, `${BASE}/dashboard`);
         await page.waitForTimeout(800);
@@ -1443,7 +1409,6 @@ app.get('/erank/my-shop', async (_req, res) => {
         return out;
       };
 
-      // E) Spell Checker (/spell-checker)
       const getSpellCheck = async () => {
         await openAndWait(page, `${BASE}/spell-checker`, `${BASE}/dashboard`);
         await page.waitForTimeout(800);
@@ -1486,8 +1451,6 @@ app.get('/erank/my-shop', async (_req, res) => {
 
         return issues;
       };
-
-      /* ===== Ejecutamos todas las partes de MyShop ===== */
 
       const { kpis, recentListings } = await getDashboard();
       const { topTags, tagReport }   = await getTagsReport();
