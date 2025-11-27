@@ -468,6 +468,42 @@ function parseTrendingReportHTML(html){
   return { count: results.length, results, header: h };
 }
 
+/* ===== Thunderbit-style row builder para Monthly ===== */
+function buildThunderStyleRow(row, opts = {}) {
+  const country = (opts.country || DEFAULT_COUNTRY || 'USA').toUpperCase();
+
+  const term       = (row.term || row.keyword || '').toString().trim();
+  const thisMonthN = toInt(row.thisMonth || row.searches || 0);
+  const lastMonthN = toInt(row.lastMonth || 0);
+
+  const delta      = thisMonthN - lastMonthN;
+  const deltaPct   = lastMonthN > 0 ? (delta / lastMonthN) : null;
+
+  let changeIndicator = '-';
+  if (delta > 0) changeIndicator = '↑';
+  else if (delta < 0) changeIndicator = '↓';
+
+  const keywordUrl =
+    `${BASE}/keyword-tool?country=${encodeURIComponent(country)}` +
+    `&keyword=${encodeURIComponent(term)}&source=etsy`;
+
+  return {
+    keyword: term,
+    keyword_url: keywordUrl,
+    this_month: thisMonthN,
+    last_month: lastMonthN,
+    change_abs: delta,
+    change_pct: deltaPct,
+    change_indicator: changeIndicator,
+    searches: thisMonthN,
+    raw_change: row.change || '',
+    avg_searches: row.avg_searches || '',
+    competition: row.competition || '',
+    avg_ctr: row.avg_ctr || '',
+    searchers_by_country: country
+  };
+}
+
 /* ===========================
    UI HELPERS
 =========================== */
@@ -1119,14 +1155,19 @@ app.get('/erank/monthly-trends', async (req, res) => {
       results = results.slice(0, limit);
     }
 
+    // Transformar resultados al formato tipo Thunderbit
+    const thunderRows = results.map(r =>
+      buildThunderStyleRow(r, { country: DEFAULT_COUNTRY })
+    );
+
     res.json({
       marketplace,
       period,
       category,
       date,
       limit,
-      count: results.length,
-      results
+      count: thunderRows.length,
+      results: thunderRows
     });
 
   } catch (e) {
@@ -1535,4 +1576,3 @@ app.get('/debug/toplist-screenshot', async (req,res)=>{
 app.listen(port, ()=> 
   console.log(`[eRank] API listening on :${port} (stealth=${STEALTH_ON}, retries=${MAX_RETRIES})`)
 );
-
