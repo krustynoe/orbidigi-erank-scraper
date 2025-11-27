@@ -1,7 +1,7 @@
 // index.js — eRank PRO scraper FINAL (TopN + scoring + debug) — clean & robust (CJS)
 
 const fs = require('node:fs');
-const path = require('node:path');
+const path = require('path');
 const express = require('express');
 const cheerio = require('cheerio');
 const { chromium } = require('playwright');
@@ -160,7 +160,7 @@ async function withRetries(fn, label='task'){
   throw last;
 }
 
-/* ===== NEW: callErankJson (JSON direct API wrapper) ===== */
+/* ===== callErankJson (ya no se usa para trend-buzz, lo dejamos para debug) ===== */
 async function callErankJson(apiPath) {
   await ensureBrowser();
   const page = await context.newPage();
@@ -185,6 +185,7 @@ async function callErankJson(apiPath) {
     try { await page.close(); } catch {}
   }
 }
+
 /* ===========================
    XHR CAPTURE & NORMALIZERS
 =========================== */
@@ -303,6 +304,65 @@ function parseTopListingsHTML(html){
     items.push( normalizeListing({listing_id:id, url:href, title}) );
   });
   return {count:items.length, results:items.filter(Boolean), htmlLength:(html?.length||0)};
+}
+
+/* ===== Trend Buzz HTML parser ===== */
+function parseTrendBuzzHTML(html){
+  const $ = cheerio.load(html);
+  const tbl = tableByHeaders($, [
+    /(keyword|color|product|recipient|style|material)/i,
+    /search\s*trend/i
+  ]);
+  if (!tbl) {
+    return { count: 0, results: [], header: [], htmlLength: (html?.length || 0) };
+  }
+  const h = tbl.header;
+  const iTerm  = h.findIndex(x => /(keyword|color|product|recipient|style|material)/i.test(x));
+  const iTrend = h.findIndex(x => /search\s*trend/i.test(x));
+
+  const results = tbl.rows
+    .map(row => {
+      const term  = (row[iTerm]  || '').trim();
+      const trend = (row[iTrend] || '').trim();
+      if (!term) return null;
+      return { term, searchTrend: trend };
+    })
+    .filter(Boolean);
+
+  return { count: results.length, results, header: h };
+}
+
+/* ===== Monthly trending-report HTML parser ===== */
+function parseTrendingReportHTML(html){
+  const $ = cheerio.load(html);
+  const tbl = tableByHeaders($, [
+    /(keyword|search\s*term|product|recipient|style|material)/i,
+    /(searches|volume|this\s*month|last\s*month)/i
+  ]);
+  if (!tbl) {
+    return { count: 0, results: [], header: [], htmlLength: (html?.length || 0) };
+  }
+  const h = tbl.header;
+
+  const iTerm  = h.findIndex(x => /(keyword|search\s*term|product|recipient|style|material)/i.test(x));
+  const iThis  = h.findIndex(x => /(this\s*month|current)/i.test(x));
+  const iLast  = h.findIndex(x => /(last\s*month|previous)/i.test(x));
+  const iChange= h.findIndex(x => /change|difference/i.test(x));
+  const iVol   = h.findIndex(x => /searches|volume/i.test(x));
+
+  const results = tbl.rows
+    .map(row => {
+      const term      = (row[iTerm]   || '').trim();
+      const thisMonth = iThis   >= 0 ? (row[iThis]   || '').trim() : '';
+      const lastMonth = iLast   >= 0 ? (row[iLast]   || '').trim() : '';
+      const change    = iChange >= 0 ? (row[iChange] || '').trim() : '';
+      const searches  = iVol    >= 0 ? (row[iVol]    || '').trim() : '';
+      if (!term) return null;
+      return { term, thisMonth, lastMonth, change, searches };
+    })
+    .filter(Boolean);
+
+  return { count: results.length, results, header: h };
 }
 
 /* ===========================
@@ -456,6 +516,7 @@ app.get('/erank/raw', async (req,res)=>{
     res.status(500).json({error:e.message});
   }
 });
+
 /* ===========================
    KEYWORDS (TOP N) — robust
 =========================== */
@@ -810,42 +871,82 @@ app.get('/erank/top-products', async (req,res)=>{
 
 
 /* ===========================
-   NUEVA RUTA — /erank/trend-buzz
+   /erank/trend-buzz (HTML scraping)
 =========================== */
 app.get('/erank/trend-buzz', async (req, res) => {
   const marketplace = (req.query.marketplace || DEFAULT_MARKET).toLowerCase();
   const country     = (req.query.country || 'USA').toUpperCase();
   const period      = (req.query.period || 'thirty').toString();
-  const category    = (req.query.category || 'Keyword').toString();
+  const categoryRaw = (req.query.category || 'Keyword').toString();
 
-  const qs = new URLSearchParams({
-    marketplace,
-    country,
-    period,
-    category
-  });
+  const cat = categoryRaw.toLowerCase();
+  const tabNameMap = {
+    keyword:   'Keywords',
+    keywords:  'Keywords',
+    color:     'Colors',
+    colors:    'Colors',
+    product:   'Products',
+    products:  'Products',
+    recipient: 'Recipients',
+    recipients:'Recipients',
+    style:     'Styles',
+    styles:    'Styles',
+    material:  'Materials',
+    materials: 'Materials'
+  };
+  const tabName = tabNameMap[cat] || 'Keywords';
 
   try {
-    const data = await withRetries(
-      () => callErankJson(`/api/trend-buzz?${qs.toString()}`),
-      'trend-buzz'
-    );
-    res.json(data);
+    await ensureBrowser();
+    const page = await context.newPage();
+    await loginIfNeeded(page);
+
+    // 1) Abrir Trend Buzz
+    await openAndWait(page, `${BASE}/trend-buzz`, `${BASE}/dashboard`);
+
+    // TODO: aquí podrías replicar marketplace/country/period si la UI lo soporta
+    // de forma similar a ensureMarketplaceCountry/ensurePeriod.
+
+    // 2) Clic en el tab correcto (Keywords / Colors / Products / Recipients / Styles / Materials)
+    const tab = page.getByRole('tab', { name: new RegExp(`^${tabName}$`, 'i') });
+    if (await tab.isVisible().catch(() => false)) {
+      await tab.click().catch(() => {});
+      await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+    }
+
+    // 3) Scroll suave por si la tabla tarda
+    await autoScroll(page, 3);
+
+    // 4) Leer HTML y parsear
+    const html = await page.content();
+    await page.close();
+
+    const parsed = parseTrendBuzzHTML(html);
+
+    res.json({
+      marketplace,
+      country,
+      period,
+      category: tabName,
+      count: parsed.count,
+      results: parsed.results
+    });
+
   } catch (e) {
-    console.error('trend-buzz error:', e);
+    console.error('trend-buzz HTML error:', e);
     res.status(500).json({ error: e.message || String(e) });
   }
 });
 
 
 /* ===========================
-   NUEVA RUTA — /erank/monthly-trends
+   /erank/monthly-trends (HTML scraping)
 =========================== */
 app.get('/erank/monthly-trends', async (req, res) => {
   const marketplace = (req.query.marketplace || DEFAULT_MARKET).toLowerCase();
-  const period      = (req.query.period || 'monthly').toString(); 
+  const period      = (req.query.period || 'monthly').toString();
   const category    = (req.query.category || 'all').toString();
-  const date        = (req.query.date || '').toString(); 
+  const date        = (req.query.date || '').toString();
   const limitRaw    = parseInt(req.query.limit || '100', 10);
   const limit       = Math.max(1, Math.min(500, limitRaw || 100));
 
@@ -853,25 +954,44 @@ app.get('/erank/monthly-trends', async (req, res) => {
     return res.status(400).json({ error: 'Missing ?date=YYYYMM' });
   }
 
-  const qs = new URLSearchParams({
-    category,
-    date,
-    limit: String(limit),
-    marketplace,
-    period
-  });
-
   try {
-    const data = await withRetries(
-      () => callErankJson(`/api/trending-report?${qs.toString()}`),
-      'monthly-trends'
-    );
-    res.json(data);
+    await ensureBrowser();
+    const page = await context.newPage();
+    await loginIfNeeded(page);
+
+    // Construimos la URL igual que en el navegador
+    const url = new URL(`${BASE}/trending-report`);
+    url.searchParams.set('marketplace', marketplace);
+    url.searchParams.set('period', period);
+    url.searchParams.set('category', category);
+    url.searchParams.set('date', date);
+    url.searchParams.set('limit', String(limit));
+
+    await openAndWait(page, url.toString(), `${BASE}/dashboard`);
+    await autoScroll(page, 3);
+
+    const html = await page.content();
+    await page.close();
+
+    const parsed = parseTrendingReportHTML(html);
+
+    res.json({
+      marketplace,
+      period,
+      category,
+      date,
+      limit,
+      count: parsed.count,
+      results: parsed.results
+    });
+
   } catch (e) {
-    console.error('monthly-trends error:', e);
+    console.error('monthly-trends HTML error:', e);
     res.status(500).json({ error: e.message || String(e) });
   }
 });
+
+
 /* ===========================
    my-shop & stats (FULL MODE)
 =========================== */
@@ -1265,7 +1385,7 @@ app.get('/debug/toplist-screenshot', async (req,res)=>{
     await typeAndSearch(pg, q);
     await openTab(pg, 'Top Listings');
     await pg.waitForTimeout(1200);
-    const buf=await pg.screenshot({ fullPage:true });
+    const buf=await pg.screenshot({fullPage:true});
     await pg.close();
     res.set('content-type','image/png').send(buf);
   }catch(e){
