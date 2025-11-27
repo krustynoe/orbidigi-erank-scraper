@@ -306,26 +306,70 @@ function parseTopListingsHTML(html){
   return {count:items.length, results:items.filter(Boolean), htmlLength:(html?.length||0)};
 }
 
-/* ===== Trend Buzz HTML parser ===== */
-function parseTrendBuzzHTML(html){
+/* ===== Trend Buzz HTML parser (NUEVO ROBUSTO) ===== */
+function parseTrendBuzzHTML(html) {
   const $ = cheerio.load(html);
-  const tbl = tableByHeaders($, [
+
+  // Intenta localizar una tabla con al menos 2 columnas.
+  // Primero probamos con cabeceras que contengan algo tipo keyword/color/product/recipient/style/material,
+  // pero si no encontramos nada, cogemos la primera tabla con >=2 th.
+  let tbl = tableByHeaders($, [
     /(keyword|color|product|recipient|style|material)/i,
-    /search\s*trend/i
+    /search\s*trend|trend|volume|search/i
   ]);
+
+  if (!tbl) {
+    $('table').each((_, t) => {
+      const $t = $(t);
+      const hdr = [];
+      $t.find('thead th, tr th').each((__, th) =>
+        hdr.push($(th).text().trim().toLowerCase())
+      );
+      if (hdr.length >= 2 && !tbl) {
+        const rows = [];
+        $t.find('tbody tr').each((__, tr) => {
+          const tds = $(tr).find('td');
+          if (!tds.length) return;
+          rows.push(
+            tds
+              .map((__, td) => $(td).text().trim())
+              .get()
+          );
+        });
+        if (rows.length) {
+          tbl = { header: hdr, rows };
+        }
+      }
+    });
+  }
+
   if (!tbl) {
     return { count: 0, results: [], header: [], htmlLength: (html?.length || 0) };
   }
+
   const h = tbl.header;
-  const iTerm  = h.findIndex(x => /(keyword|color|product|recipient|style|material)/i.test(x));
-  const iTrend = h.findIndex(x => /search\s*trend/i.test(x));
+
+  // Por defecto: primera columna = término, segunda columna = valor/tendencia.
+  let iTerm = 0;
+  let iTrend = h.length > 1 ? 1 : 0;
+
+  // Si detectamos alguna cabecera más específica, la usamos.
+  const idxTerm = h.findIndex(x =>
+    /(keyword|color|product|recipient|style|material)/i.test(x)
+  );
+  if (idxTerm >= 0) iTerm = idxTerm;
+
+  const idxTrend = h.findIndex(x =>
+    /search\s*trend|trend|volume|search/i.test(x)
+  );
+  if (idxTrend >= 0) iTrend = idxTrend;
 
   const results = tbl.rows
     .map(row => {
-      const term  = (row[iTerm]  || '').trim();
+      const term = (row[iTerm] || '').trim();
       const trend = (row[iTrend] || '').trim();
       if (!term) return null;
-      return { term, searchTrend: trend };
+      return { term, searchTrend: trend || '' };
     })
     .filter(Boolean);
 
@@ -871,7 +915,7 @@ app.get('/erank/top-products', async (req,res)=>{
 
 
 /* ===========================
-   /erank/trend-buzz (HTML scraping)
+   /erank/trend-buzz (HTML scraping robusto)
 =========================== */
 app.get('/erank/trend-buzz', async (req, res) => {
   const marketplace = (req.query.marketplace || DEFAULT_MARKET).toLowerCase();
@@ -879,6 +923,7 @@ app.get('/erank/trend-buzz', async (req, res) => {
   const period      = (req.query.period || 'thirty').toString();
   const categoryRaw = (req.query.category || 'Keyword').toString();
 
+  // Mapa de categoría lógica → nombre del tab en la UI
   const cat = categoryRaw.toLowerCase();
   const tabNameMap = {
     keyword:   'Keywords',
@@ -904,20 +949,59 @@ app.get('/erank/trend-buzz', async (req, res) => {
     // 1) Abrir Trend Buzz
     await openAndWait(page, `${BASE}/trend-buzz`, `${BASE}/dashboard`);
 
-    // TODO: aquí podrías replicar marketplace/country/period si la UI lo soporta
-    // de forma similar a ensureMarketplaceCountry/ensurePeriod.
+    // (Opcional) si quieres replicar marketplace/país, puedes reusar ensureMarketplaceCountry aquí
+    // await ensureMarketplaceCountry(page, marketplace, country);
 
-    // 2) Clic en el tab correcto (Keywords / Colors / Products / Recipients / Styles / Materials)
-    const tab = page.getByRole('tab', { name: new RegExp(`^${tabName}$`, 'i') });
-    if (await tab.isVisible().catch(() => false)) {
-      await tab.click().catch(() => {});
-      await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+    // 2) Ajustar timeframe según "period" (solo si quieres; por defecto: Past 30 Days)
+    try {
+      const periodMap = {
+        thirty: /past\s*30\s*days/i,
+        seven: /past\s*7\s*days/i,
+        yesterday: /yesterday/i
+      };
+      const rx = periodMap[period.toLowerCase()];
+      if (rx) {
+        const btn = page.getByRole('button', { name: rx });
+        if (await btn.first().isVisible().catch(() => false)) {
+          await btn.first().click().catch(() => {});
+          await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+        }
+      }
+    } catch (e) {
+      console.warn('trend-buzz period switch failed:', e.message || e);
     }
 
-    // 3) Scroll suave por si la tabla tarda
+    // 3) Clic en el TAB correcto (Keywords / Colors / Products / Recipients / Styles / Materials)
+    let clicked = false;
+    try {
+      const tab = page.getByRole('tab', { name: new RegExp(`^${tabName}$`, 'i') });
+      if (await tab.first().isVisible().catch(() => false)) {
+        await tab.first().click().catch(() => {});
+        clicked = true;
+        await page.waitForTimeout(1500);
+        await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+      }
+    } catch (e) {
+      console.warn('trend-buzz tab click via role failed:', e.message || e);
+    }
+
+    // Fallback: buscar por texto si el rol "tab" no funciona
+    if (!clicked) {
+      const loc = page.locator(`text=${tabName}`);
+      if (await loc.first().isVisible().catch(() => false)) {
+        await loc.first().click().catch(() => {});
+        await page.waitForTimeout(1500);
+        await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+      } else {
+        console.warn('trend-buzz: no se encontró tab para', tabName);
+      }
+    }
+
+    // 4) Esperar a que aparezca alguna tabla
+    await page.waitForSelector('table', { timeout: 8000 }).catch(() => {});
     await autoScroll(page, 3);
 
-    // 4) Leer HTML y parsear
+    // 5) HTML + parseo
     const html = await page.content();
     await page.close();
 
