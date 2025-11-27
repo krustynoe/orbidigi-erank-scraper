@@ -371,6 +371,72 @@ function parseTrendBuzzHTML(html) {
   return { count: results.length, results, header: h };
 }
 
+/* ===== Trend Buzz JSON parser (via XHR /api/trend-buzz) ===== */
+function parseTrendBuzzJSON(json, tabName) {
+  if (!json || typeof json !== 'object') {
+    return { count: 0, results: [] };
+  }
+
+  const arrays = findArraysDeep(
+    json,
+    x =>
+      x &&
+      typeof x === 'object' &&
+      (
+        'term' in x ||
+        'keyword' in x ||
+        'name' in x ||
+        'color' in x ||
+        'product' in x ||
+        'recipient' in x ||
+        'style' in x ||
+        'material' in x
+      )
+  );
+
+  const rows = [];
+  for (const arr of arrays) {
+    for (const o of arr) {
+      if (!o || typeof o !== 'object') continue;
+
+      const term =
+        (o.term ||
+         o.keyword ||
+         o.name ||
+         o.color ||
+         o.product ||
+         o.recipient ||
+         o.style ||
+         o.material ||
+         '').toString().trim();
+
+      if (!term) continue;
+
+      const searchTrend = (
+        o.search_trend ||
+        o.trend ||
+        o.score ||
+        o.value ||
+        o.change ||
+        o.rank ||
+        ''
+      ).toString();
+
+      rows.push({ term, searchTrend, _tab: tabName });
+    }
+  }
+
+  const seen = new Set();
+  const results = rows.filter(r => {
+    const k = (r.term || '').toLowerCase();
+    if (!k || seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+
+  return { count: results.length, results };
+}
+
 /* ===== Monthly trending-report JSON parser (via XHR) ===== */
 function parseTrendingReportJSON(json) {
   if (!json || typeof json !== 'object') {
@@ -598,7 +664,7 @@ async function enrichShops(page, items){
       const href = a ? (a.getAttribute('href')||'') : '';
       const shopA= card.querySelector('a[href*="/shop/"]');
       const shopHref = shopA ? (shopA.getAttribute('href')||'') : '';
-      const shopName = shopA ? (shopA.textContent||'').trim() : '';
+      const shopName = shopA ? (shopName = shopA.textContent||'').trim() : '';
       const m = /\/shop\/([^/?#]+)/i.exec(shopHref||'');
       const key = id || href;
       if (key) out[key] = { shop_id: m ? m[1] : '', shop_name: shopName };
@@ -1001,7 +1067,7 @@ app.get('/erank/top-products', async (req,res)=>{
 
 
 /* ===========================
-   TREND BUZZ
+   TREND BUZZ (JSON + HTML fallback)
 =========================== */
 app.get('/erank/trend-buzz', async (req, res) => {
   const marketplace = (req.query.marketplace || DEFAULT_MARKET).toLowerCase();
@@ -1075,13 +1141,42 @@ app.get('/erank/trend-buzz', async (req, res) => {
       }
     }
 
-    await page.waitForSelector('table', { timeout: 8000 }).catch(() => {});
-    await autoScroll(page, 3);
+    // Esperar a que haya filas reales en la tabla
+    await page.waitForSelector('table tbody tr td', { timeout: 15000 }).catch(() => {});
+    await autoScroll(page, 4);
 
-    const html = await page.content();
+    // 1) Intentar capturar JSON de /api/trend-buzz
+    const cap = await captureJson(
+      page,
+      x =>
+        x &&
+        typeof x === 'object' &&
+        (
+          'term' in x ||
+          'keyword' in x ||
+          'name' in x ||
+          'color' in x ||
+          'product' in x ||
+          'recipient' in x ||
+          'style' in x ||
+          'material' in x
+        ),
+      5000
+    );
+
+    let parsed = { count: 0, results: [] };
+
+    if (cap.length) {
+      parsed = parseTrendBuzzJSON(cap[0].json, tabName);
+    }
+
+    // 2) Fallback: si no hay JSON usable, parsear HTML
+    if (!parsed || !parsed.results || !parsed.results.length) {
+      const html = await page.content();
+      parsed = parseTrendBuzzHTML(html);
+    }
+
     await page.close();
-
-    const parsed = parseTrendBuzzHTML(html);
 
     res.json({
       marketplace,
@@ -1093,7 +1188,7 @@ app.get('/erank/trend-buzz', async (req, res) => {
     });
 
   } catch (e) {
-    console.error('trend-buzz HTML error:', e);
+    console.error('trend-buzz error:', e);
     res.status(500).json({ error: e.message || String(e) });
   }
 });
@@ -1576,3 +1671,4 @@ app.get('/debug/toplist-screenshot', async (req,res)=>{
 app.listen(port, ()=> 
   console.log(`[eRank] API listening on :${port} (stealth=${STEALTH_ON}, retries=${MAX_RETRIES})`)
 );
+
