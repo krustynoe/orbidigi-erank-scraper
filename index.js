@@ -264,10 +264,10 @@ function tableByHeaders($, patterns){
     $t.find('thead th, tr th').each((__,th)=> hdr.push($(th).text().trim().toLowerCase()));
     if (!hdr.length) return;
     if (!patterns.every(rx=> hdr.some(h=>rx.test(h)))) return;
-    const rows=[]; 
+    const rows=[];
     $t.find('tbody tr').each((__,tr)=>{
-      const tds=$(tr).find('td'); 
-      if(!tds.length) return; 
+      const tds=$(tr).find('td');
+      if(!tds.length) return;
       rows.push(tds.map((__,td)=>$(td).text().trim()).get());
     });
     if (rows.length) tables.push({header:hdr, rows});
@@ -1067,7 +1067,7 @@ app.get('/erank/top-products', async (req,res)=>{
 
 
 /* ===========================
-   TREND BUZZ (JSON + HTML fallback)
+   TREND BUZZ (JSON + HTML fallback) + DEBUG LOGS
 =========================== */
 app.get('/erank/trend-buzz', async (req, res) => {
   const marketplace = (req.query.marketplace || DEFAULT_MARKET).toLowerCase();
@@ -1097,8 +1097,12 @@ app.get('/erank/trend-buzz', async (req, res) => {
     const page = await context.newPage();
     await loginIfNeeded(page);
 
+    console.log('\n====== [/erank/trend-buzz] ======');
+    console.log('params:', { marketplace, country, period, category: categoryRaw, tabName });
+
     await openAndWait(page, `${BASE}/trend-buzz`, `${BASE}/dashboard`);
 
+    // Period (por si afecta a los datos)
     try {
       const periodMap = {
         thirty: /past\s*30\s*days/i,
@@ -1117,6 +1121,7 @@ app.get('/erank/trend-buzz', async (req, res) => {
       console.warn('trend-buzz period switch failed:', e.message || e);
     }
 
+    // 1) Intento de click en el TAB correcto
     let clicked = false;
     try {
       const tab = page.getByRole('tab', { name: new RegExp(`^${tabName}$`, 'i') });
@@ -1130,10 +1135,12 @@ app.get('/erank/trend-buzz', async (req, res) => {
       console.warn('trend-buzz tab click via role failed:', e.message || e);
     }
 
+    // Fallback de click por texto si todavía no se ha hecho click
     if (!clicked) {
       const loc = page.locator(`text=${tabName}`);
       if (await loc.first().isVisible().catch(() => false)) {
         await loc.first().click().catch(() => {});
+        clicked = true;
         await page.waitForTimeout(1500);
         await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
       } else {
@@ -1141,11 +1148,13 @@ app.get('/erank/trend-buzz', async (req, res) => {
       }
     }
 
+    console.log('[trend-buzz] clicked tab?', clicked);
+
     // Esperar a que haya filas reales en la tabla
     await page.waitForSelector('table tbody tr td', { timeout: 15000 }).catch(() => {});
     await autoScroll(page, 4);
 
-    // 1) Intentar capturar JSON de /api/trend-buzz
+    // 2) Captura XHR /api/trend-buzz
     const cap = await captureJson(
       page,
       x =>
@@ -1164,27 +1173,48 @@ app.get('/erank/trend-buzz', async (req, res) => {
       5000
     );
 
-    let parsed = { count: 0, results: [] };
-
-    if (cap.length) {
-      parsed = parseTrendBuzzJSON(cap[0].json, tabName);
+    const capturedXHRs = cap.length;
+    let jsonKeys = [];
+    if (capturedXHRs > 0) {
+      try {
+        const root = cap[0].json;
+        if (root && typeof root === 'object') {
+          jsonKeys = Object.keys(root);
+        }
+      } catch {}
     }
 
-    // 2) Fallback: si no hay JSON usable, parsear HTML
+    console.log('[trend-buzz] capturedXHRs:', capturedXHRs, 'jsonKeys:', jsonKeys);
+
+    let parsed = { count: 0, results: [] };
+
+    // 3) Parse JSON si existe
+    if (cap.length) {
+      parsed = parseTrendBuzzJSON(cap[0].json, tabName);
+      const rc = parsed?.count || (parsed?.results?.length || 0);
+      console.log('[trend-buzz] parsed from JSON, resultCount:', rc);
+    }
+
+    // 4) Fallback HTML si no hay resultados desde JSON
     if (!parsed || !parsed.results || !parsed.results.length) {
       const html = await page.content();
       parsed = parseTrendBuzzHTML(html);
+      const rc = parsed?.count || (parsed?.results?.length || 0);
+      console.log('[trend-buzz] fallback HTML, resultCount:', rc);
     }
 
     await page.close();
+
+    const resultCount = parsed?.count || (parsed?.results?.length || 0);
+    console.log('[trend-buzz] FINAL resultCount:', resultCount);
 
     res.json({
       marketplace,
       country,
       period,
       category: tabName,
-      count: parsed.count,
-      results: parsed.results
+      count: resultCount,
+      results: parsed.results || []
     });
 
   } catch (e) {
@@ -1197,6 +1227,7 @@ app.get('/erank/trend-buzz', async (req, res) => {
 /* ===========================
    MONTHLY TRENDS
    (captura XHR /api/trending-report desde la UI + fallback HTML)
+   + DEBUG LOGS
 =========================== */
 app.get('/erank/monthly-trends', async (req, res) => {
   const marketplace = (req.query.marketplace || DEFAULT_MARKET).toLowerCase();
@@ -1209,6 +1240,9 @@ app.get('/erank/monthly-trends', async (req, res) => {
   if (!date) {
     return res.status(400).json({ error: 'Missing ?date=YYYYMM' });
   }
+
+  console.log('\n====== [/erank/monthly-trends] ======');
+  console.log('params:', { marketplace, period, category, date, limit });
 
   try {
     await ensureBrowser();
@@ -1225,6 +1259,7 @@ app.get('/erank/monthly-trends', async (req, res) => {
     await openAndWait(page, uiUrl.toString(), `${BASE}/dashboard`);
     await autoScroll(page, 3);
 
+    // 1) Captura XHR
     const cap = await captureJson(
       page,
       x => x && typeof x === 'object' &&
@@ -1232,15 +1267,34 @@ app.get('/erank/monthly-trends', async (req, res) => {
       5000
     );
 
-    let parsed = { count: 0, results: [] };
-
-    if (cap.length) {
-      parsed = parseTrendingReportJSON(cap[0].json);
+    const capturedXHRs = cap.length;
+    let jsonKeys = [];
+    if (capturedXHRs > 0) {
+      try {
+        const root = cap[0].json;
+        if (root && typeof root === 'object') {
+          jsonKeys = Object.keys(root);
+        }
+      } catch {}
     }
 
+    console.log('[monthly-trends] capturedXHRs:', capturedXHRs, 'jsonKeys:', jsonKeys);
+
+    let parsed = { count: 0, results: [] };
+
+    // 2) Parse desde JSON
+    if (cap.length) {
+      parsed = parseTrendingReportJSON(cap[0].json);
+      const rc = parsed?.count || (parsed?.results?.length || 0);
+      console.log('[monthly-trends] parsed from JSON, resultCount:', rc);
+    }
+
+    // 3) Fallback HTML si el parser JSON no ha devuelto nada
     if (!parsed || !parsed.results || !parsed.results.length) {
       const html = await page.content();
       parsed = parseTrendingReportHTML(html);
+      const rc = parsed?.count || (parsed?.results?.length || 0);
+      console.log('[monthly-trends] fallback HTML, resultCount:', rc);
     }
 
     await page.close();
@@ -1255,13 +1309,16 @@ app.get('/erank/monthly-trends', async (req, res) => {
       buildThunderStyleRow(r, { country: DEFAULT_COUNTRY })
     );
 
+    const resultCount = thunderRows.length;
+    console.log('[monthly-trends] FINAL resultCount:', resultCount);
+
     res.json({
       marketplace,
       period,
       category,
       date,
       limit,
-      count: thunderRows.length,
+      count: resultCount,
       results: thunderRows
     });
 
@@ -1671,4 +1728,3 @@ app.get('/debug/toplist-screenshot', async (req,res)=>{
 app.listen(port, ()=> 
   console.log(`[eRank] API listening on :${port} (stealth=${STEALTH_ON}, retries=${MAX_RETRIES})`)
 );
-
