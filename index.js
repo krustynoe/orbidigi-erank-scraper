@@ -255,7 +255,7 @@ function normalizeListing(o){
 }
 
 /* ===========================
-   HTML FALLBACK PARSERS
+   HTML FALLBACK PARSERS (para otros endpoints)
 =========================== */
 function tableByHeaders($, patterns){
   const tables=[];
@@ -306,7 +306,7 @@ function parseTopListingsHTML(html){
   return {count:items.length, results:items.filter(Boolean), htmlLength:(html?.length||0)};
 }
 
-/* ===== Trend Buzz HTML parser (ajustado) ===== */
+/* ===== Trend Buzz HTML parser (ya no se usa, pero lo dejamos por si acaso) ===== */
 function parseTrendBuzzHTML(html) {
   const $ = cheerio.load(html);
 
@@ -327,7 +327,7 @@ function parseTrendBuzzHTML(html) {
   let iTrend  = h.findIndex(x => /(search\s*trend|trend)/i.test(x));
   let iChange = h.findIndex(x => /(change)/i.test(x));
 
-  if (iTerm < 0)  iTerm  = 1; // '#', 'keywords', ...
+  if (iTerm < 0)  iTerm  = 1;
   if (iTrend < 0) iTrend = 2;
 
   console.log('[trend-buzz][HTML] column indexes:', { iTerm, iTrend, iChange });
@@ -337,7 +337,6 @@ function parseTrendBuzzHTML(html) {
       const term   = (r[iTerm]  || '').trim();
       const trend  = (r[iTrend] || '').trim();
       const change = iChange >= 0 ? (r[iChange] || '').trim() : '';
-
       if (!term) return null;
       return { term, searchTrend: trend, change };
     })
@@ -478,7 +477,7 @@ function parseTrendingReportJSON(json) {
   return { count: results.length, results };
 }
 
-/* ===== Monthly trending-report HTML parser ===== */
+/* ===== Monthly trending-report HTML parser (para /monthly-trends) ===== */
 function parseTrendingReportHTML(html) {
   const $ = cheerio.load(html);
 
@@ -1108,7 +1107,7 @@ app.get('/erank/top-products', async (req,res)=>{
 
 
 /* ===========================
-   TREND BUZZ (JSON + HTML fallback) + DEBUG + FORCE RENDER
+   TREND BUZZ (JSON + DOM fallback definitivo)
 =========================== */
 app.get('/erank/trend-buzz', async (req, res) => {
   const marketplace = (req.query.marketplace || DEFAULT_MARKET).toLowerCase();
@@ -1143,7 +1142,7 @@ app.get('/erank/trend-buzz', async (req, res) => {
 
     await openAndWait(page, `${BASE}/trend-buzz`, `${BASE}/dashboard`);
 
-    // seleccionar timeframe
+    // timeframe
     try {
       const periodMap = {
         thirty: /past\s*30\s*days/i,
@@ -1162,7 +1161,7 @@ app.get('/erank/trend-buzz', async (req, res) => {
       console.warn('trend-buzz period switch failed:', e.message || e);
     }
 
-    // tab correcto
+    // Tab
     let clicked = false;
     try {
       const tab = page.getByRole('tab', { name: new RegExp(`^${tabName}$`, 'i') });
@@ -1190,7 +1189,7 @@ app.get('/erank/trend-buzz', async (req, res) => {
 
     console.log('[trend-buzz] clicked tab?', clicked);
 
-    // 🔥 Forzar render de todas las filas dentro del contenedor de tabla (virtual scroll)
+    // Forzar render dentro del contenedor de tabla (virtual scroll)
     console.log('[trend-buzz] forcing table render...');
     await page.evaluate(async () => {
       const table =
@@ -1203,17 +1202,16 @@ app.get('/erank/trend-buzz', async (req, res) => {
       const step = 80;
       for (let y = 0; y < table.scrollHeight; y += step) {
         table.scrollTo(0, y);
-        // pequeña pausa para que React pinte filas
         // eslint-disable-next-line no-await-in-loop
         await new Promise(r => setTimeout(r, 120));
       }
     }).catch(e => console.warn('[trend-buzz] force render error:', e.message || e));
 
-    await page.waitForSelector('tbody tr', { timeout: 8000 }).catch(()=>{});
+    await page.waitForTimeout(1000);
+    await page.waitForSelector('table, tbody tr, div[role="row"]', { timeout: 8000 }).catch(()=>{});
     console.log('[trend-buzz] table render forced');
 
-    await autoScroll(page, 4);
-
+    // 1) XHR (por si acaso)
     const cap = await captureJson(
       page,
       x =>
@@ -1229,7 +1227,7 @@ app.get('/erank/trend-buzz', async (req, res) => {
           'style' in x ||
           'material' in x
         ),
-      5000
+      4000
     );
 
     const capturedXHRs = cap.length;
@@ -1253,12 +1251,67 @@ app.get('/erank/trend-buzz', async (req, res) => {
       console.log('[trend-buzz] parsed from JSON, resultCount:', rc);
     }
 
+    // 2) DOM directo (definitivo)
     if (!parsed || !parsed.results || !parsed.results.length) {
-      const html = await page.content();
-      console.log('[trend-buzz] html length:', html.length);
-      parsed = parseTrendBuzzHTML(html);
-      const rc = parsed?.count || (parsed?.results?.length || 0);
-      console.log('[trend-buzz] fallback HTML, resultCount:', rc);
+      console.log('[trend-buzz] extracting rows directly from DOM...');
+
+      const domRows = await page.evaluate(() => {
+        const extractText = (el) => (el.textContent || "").trim();
+        const rows = [];
+
+        // a) TR + TD
+        const trs = Array.from(document.querySelectorAll("tbody tr"));
+        for (const tr of trs) {
+          const tds = Array.from(tr.querySelectorAll("td")).map(extractText).filter(Boolean);
+          if (!tds.length) continue;
+
+          let term = "";
+          for (const c of tds) {
+            if (/[a-zA-Z]/.test(c) && c !== "#") {
+              term = c;
+              break;
+            }
+          }
+          if (!term) continue;
+
+          const trend  = tds.find(c => /^[0-9,.kK]+$/.test(c)) || "";
+          const change = tds.find(c => c.includes("%") || c === "-" ) || "";
+
+          rows.push({ term, searchTrend: trend, change });
+        }
+
+        // b) React: div[role=row]
+        const divRows = Array.from(document.querySelectorAll('div[role="row"]'));
+        for (const row of divRows) {
+          const cells = Array.from(row.querySelectorAll('div[role="cell"], span'))
+            .map(extractText)
+            .filter(Boolean);
+          if (!cells.length) continue;
+
+          let term = "";
+          for (const c of cells) {
+            if (/[a-zA-Z]/.test(c) && c !== "#") {
+              term = c;
+              break;
+            }
+          }
+          if (!term) continue;
+
+          const trend  = cells.find(c => /^[0-9,.kK]+$/.test(c)) || "";
+          const change = cells.find(c => c.includes("%") || c === "-") || "";
+
+          rows.push({ term, searchTrend: trend, change });
+        }
+
+        return rows;
+      });
+
+      console.log('[trend-buzz] DOM rows found:', domRows.length);
+
+      parsed = {
+        count: domRows.length,
+        results: domRows
+      };
     }
 
     await page.close();
