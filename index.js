@@ -160,7 +160,7 @@ async function withRetries(fn, label='task'){
   throw last;
 }
 
-/* ===== callErankJson (por si en el futuro usamos otros /api/...) ===== */
+/* ===== callErankJson ===== */
 async function callErankJson(apiPath) {
   await ensureBrowser();
   const page = await context.newPage();
@@ -306,7 +306,7 @@ function parseTopListingsHTML(html){
   return {count:items.length, results:items.filter(Boolean), htmlLength:(html?.length||0)};
 }
 
-/* ===== Trend Buzz HTML parser (ajustado a '#, keywords, search trend, change') ===== */
+/* ===== Trend Buzz HTML parser (ajustado) ===== */
 function parseTrendBuzzHTML(html) {
   const $ = cheerio.load(html);
 
@@ -323,14 +323,12 @@ function parseTrendBuzzHTML(html) {
   const h = tbl.header;
   console.log('[trend-buzz][HTML] FINAL header used:', h);
 
-  // columnas reales
   let iTerm   = h.findIndex(x => /(keyword|keywords|term)/i.test(x));
   let iTrend  = h.findIndex(x => /(search\s*trend|trend)/i.test(x));
   let iChange = h.findIndex(x => /(change)/i.test(x));
 
-  // fallback basado en tu cabecera real: [ '#', 'keywords', 'search trend', 'change' ]
-  if (iTerm < 0)  iTerm  = 1; // "keywords"
-  if (iTrend < 0) iTrend = 2; // "search trend"
+  if (iTerm < 0)  iTerm  = 1; // '#', 'keywords', ...
+  if (iTrend < 0) iTrend = 2;
 
   console.log('[trend-buzz][HTML] column indexes:', { iTerm, iTrend, iChange });
 
@@ -350,7 +348,7 @@ function parseTrendBuzzHTML(html) {
   return { count: results.length, results };
 }
 
-/* ===== Trend Buzz JSON parser (via XHR /api/trend-buzz) ===== */
+/* ===== Trend Buzz JSON parser ===== */
 function parseTrendBuzzJSON(json, tabName) {
   if (!json || typeof json !== 'object') {
     return { count: 0, results: [] };
@@ -416,7 +414,7 @@ function parseTrendBuzzJSON(json, tabName) {
   return { count: results.length, results };
 }
 
-/* ===== Monthly trending-report JSON parser (via XHR) ===== */
+/* ===== Monthly trending-report JSON parser ===== */
 function parseTrendingReportJSON(json) {
   if (!json || typeof json !== 'object') {
     return { count: 0, results: [] };
@@ -480,7 +478,7 @@ function parseTrendingReportJSON(json) {
   return { count: results.length, results };
 }
 
-/* ===== Monthly trending-report HTML parser (agresivo + logs) ===== */
+/* ===== Monthly trending-report HTML parser ===== */
 function parseTrendingReportHTML(html) {
   const $ = cheerio.load(html);
 
@@ -1110,7 +1108,7 @@ app.get('/erank/top-products', async (req,res)=>{
 
 
 /* ===========================
-   TREND BUZZ (JSON + HTML fallback) + DEBUG LOGS
+   TREND BUZZ (JSON + HTML fallback) + DEBUG + FORCE RENDER
 =========================== */
 app.get('/erank/trend-buzz', async (req, res) => {
   const marketplace = (req.query.marketplace || DEFAULT_MARKET).toLowerCase();
@@ -1145,7 +1143,7 @@ app.get('/erank/trend-buzz', async (req, res) => {
 
     await openAndWait(page, `${BASE}/trend-buzz`, `${BASE}/dashboard`);
 
-    // selector de periodo (por si cambia los datos)
+    // seleccionar timeframe
     try {
       const periodMap = {
         thirty: /past\s*30\s*days/i,
@@ -1164,6 +1162,7 @@ app.get('/erank/trend-buzz', async (req, res) => {
       console.warn('trend-buzz period switch failed:', e.message || e);
     }
 
+    // tab correcto
     let clicked = false;
     try {
       const tab = page.getByRole('tab', { name: new RegExp(`^${tabName}$`, 'i') });
@@ -1191,7 +1190,28 @@ app.get('/erank/trend-buzz', async (req, res) => {
 
     console.log('[trend-buzz] clicked tab?', clicked);
 
-    await page.waitForSelector('table tbody tr td', { timeout: 15000 }).catch(() => {});
+    // 🔥 Forzar render de todas las filas dentro del contenedor de tabla (virtual scroll)
+    console.log('[trend-buzz] forcing table render...');
+    await page.evaluate(async () => {
+      const table =
+        document.querySelector('.ant-table-body') ||
+        document.querySelector('.ant-table-content') ||
+        document.querySelector('[class*="table"]');
+
+      if (!table) return;
+
+      const step = 80;
+      for (let y = 0; y < table.scrollHeight; y += step) {
+        table.scrollTo(0, y);
+        // pequeña pausa para que React pinte filas
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise(r => setTimeout(r, 120));
+      }
+    }).catch(e => console.warn('[trend-buzz] force render error:', e.message || e));
+
+    await page.waitForSelector('tbody tr', { timeout: 8000 }).catch(()=>{});
+    console.log('[trend-buzz] table render forced');
+
     await autoScroll(page, 4);
 
     const cap = await captureJson(
