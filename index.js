@@ -477,7 +477,7 @@ function parseTrendingReportJSON(json) {
   return { count: results.length, results };
 }
 
-/* ===== Monthly trending-report HTML parser (para /monthly-trends) ===== */
+/* ===== Monthly trending-report HTML parser (para otros casos) ===== */
 function parseTrendingReportHTML(html) {
   const $ = cheerio.load(html);
 
@@ -1336,19 +1336,22 @@ app.get('/erank/trend-buzz', async (req, res) => {
 
 
 /* ===========================
-   MONTHLY TRENDS
+   MONTHLY TRENDS (DOM sobre /trending/...)
 =========================== */
 app.get('/erank/monthly-trends', async (req, res) => {
-  const marketplace = (req.query.marketplace || DEFAULT_MARKET).toLowerCase();
-  const period      = (req.query.period || 'monthly').toString();
-  const category    = (req.query.category || 'all').toString();
-  const date        = (req.query.date || '').toString();      // YYYYMM
+  const marketplace = (req.query.marketplace || DEFAULT_MARKET).toLowerCase(); // etsy
+  const period      = (req.query.period || 'monthly').toString();              // no se usa mucho aquí
+  const category    = (req.query.category || 'all').toString();                // all, jewelry, etc.
+  const date        = (req.query.date || '').toString();                       // YYYYMM
   const limitRaw    = parseInt(req.query.limit || '100', 10);
   const limit       = Math.max(1, Math.min(500, limitRaw || 100));
 
   if (!date) {
     return res.status(400).json({ error: 'Missing ?date=YYYYMM' });
   }
+
+  const catSegment    = category.toLowerCase();      // p.ej. "all"
+  const marketSegment = marketplace.toLowerCase();   // "etsy"
 
   console.log('\n====== [/erank/monthly-trends] ======');
   console.log('params:', { marketplace, period, category, date, limit });
@@ -1358,63 +1361,88 @@ app.get('/erank/monthly-trends', async (req, res) => {
     const page = await context.newPage();
     await loginIfNeeded(page);
 
-    const uiUrl = new URL(`${BASE}/trending-report`);
-    uiUrl.searchParams.set('category', category);
-    uiUrl.searchParams.set('date', date);
-    uiUrl.searchParams.set('limit', String(limit));
-    uiUrl.searchParams.set('marketplace', marketplace);
-    uiUrl.searchParams.set('period', period);
+    // URL real que ves en el navegador: /trending/etsy/all/202510
+    const uiUrl = `${BASE}/trending/${marketSegment}/${catSegment}/${date}`;
+    console.log('[monthly-trends] UI URL:', uiUrl);
 
-    console.log('[monthly-trends] UI URL:', uiUrl.toString());
+    await openAndWait(page, uiUrl, `${BASE}/dashboard`);
+    await page.waitForTimeout(1000);
 
-    await openAndWait(page, uiUrl.toString(), `${BASE}/dashboard`);
-    await autoScroll(page, 3);
+    // Forzar scroll dentro del cuerpo de la tabla
+    await page.evaluate(async () => {
+      const table =
+        document.querySelector('.ant-table-body') ||
+        document.querySelector('.ant-table-content') ||
+        document.querySelector('[class*="table"]');
 
-    const cap = await captureJson(
-      page,
-      x => x && typeof x === 'object' &&
-           ('term' in x || 'keyword' in x || 'search_term' in x),
-      8000
-    );
+      if (!table) return;
 
-    const capturedXHRs = cap.length;
-    let jsonKeys = [];
-    if (capturedXHRs > 0) {
-      try {
-        const root = cap[0].json;
-        if (root && typeof root === 'object') {
-          jsonKeys = Object.keys(root);
-        }
-      } catch {}
-    }
+      const step = 80;
+      for (let y = 0; y < table.scrollHeight; y += step) {
+        table.scrollTo(0, y);
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise(r => setTimeout(r, 100));
+      }
+    }).catch(e => console.warn('[monthly-trends] force render error:', e.message || e));
 
-    console.log('[monthly-trends] capturedXHRs:', capturedXHRs, 'jsonKeys:', jsonKeys);
+    await page.waitForSelector('tbody tr, div[role="row"]', { timeout: 8000 }).catch(()=>{});
 
-    let parsed = { count: 0, results: [] };
+    console.log('[monthly-trends] extracting rows from DOM...');
 
-    if (cap.length) {
-      parsed = parseTrendingReportJSON(cap[0].json);
-      const rc = parsed?.count || (parsed?.results?.length || 0);
-      console.log('[monthly-trends] parsed from JSON, resultCount:', rc);
-    }
+    const rawRows = await page.evaluate(() => {
+      const extract = el => (el.textContent || '').trim();
+      const out = [];
 
-    if (!parsed || !parsed.results || !parsed.results.length) {
-      const html = await page.content();
-      console.log('[monthly-trends] html length:', html.length);
-      parsed = parseTrendingReportHTML(html);
-      const rc = parsed?.count || (parsed?.results?.length || 0);
-      console.log('[monthly-trends] fallback HTML, resultCount:', rc);
-    }
+      // 1) TR + TD clásicos
+      const trs = Array.from(document.querySelectorAll('tbody tr'));
+      for (const tr of trs) {
+        const tds = Array.from(tr.querySelectorAll('td')).map(extract).filter(Boolean);
+        if (tds.length < 2) continue;
+
+        // estructura típica: [ '#', 'keyword', 'Trend graph', 'Etsy searches' ]
+        const term     = (tds[1] || '').trim();
+        const searches = (tds[tds.length - 1] || '').trim();
+
+        if (!term) continue;
+        out.push({ term, searches });
+      }
+
+      // 2) Fallback React: div[role=row]
+      const divRows = Array.from(document.querySelectorAll('div[role="row"]'));
+      for (const row of divRows) {
+        const cells = Array.from(row.querySelectorAll('div[role="cell"], span'))
+          .map(extract)
+          .filter(Boolean);
+
+        if (cells.length < 2) continue;
+
+        const term     = (cells[1] || '').trim();
+        const searches = (cells[cells.length - 1] || '').trim();
+
+        if (!term) continue;
+        out.push({ term, searches });
+      }
+
+      return out;
+    });
+
+    console.log('[monthly-trends] DOM rows found:', rawRows.length);
 
     await page.close();
 
-    let results = parsed.results || [];
-    if (results.length > limit) {
-      results = results.slice(0, limit);
-    }
+    let rows = rawRows.slice(0, limit);
 
-    const thunderRows = results.map(r =>
-      buildThunderStyleRow(r, { country: DEFAULT_COUNTRY })
+    const thunderRows = rows.map(r =>
+      buildThunderStyleRow(
+        {
+          term: r.term,
+          thisMonth: r.searches,
+          lastMonth: '',
+          change: '',
+          searches: r.searches
+        },
+        { country: DEFAULT_COUNTRY }
+      )
     );
 
     const resultCount = thunderRows.length;
