@@ -306,104 +306,48 @@ function parseTopListingsHTML(html){
   return {count:items.length, results:items.filter(Boolean), htmlLength:(html?.length||0)};
 }
 
-/* ===== Trend Buzz HTML parser (robusto + logs) ===== */
+/* ===== Trend Buzz HTML parser (ajustado a '#, keywords, search trend, change') ===== */
 function parseTrendBuzzHTML(html) {
   const $ = cheerio.load(html);
 
-  const tableCount = $('table').length;
-  console.log('[trend-buzz][HTML] tables on page:', tableCount);
-
-  // 1) Intento "normal": buscar tabla con headers decentes
-  let tbl = tableByHeaders($, [
-    /(keyword|color|product|recipient|style|material|term)/i,
-    /search\s*trend|trend|volume|search|score/i
+  const tbl = tableByHeaders($, [
+    /(keyword|keywords|term)/i,
+    /(search\s*trend|trend|change)/i
   ]);
 
-  // 2) Fallback: primera tabla con >=2 th y filas
   if (!tbl) {
-    $('table').each((_, t) => {
-      if (tbl) return;
-      const $t = $(t);
-      const hdr = [];
-      $t.find('thead th, tr th').each((__, th) =>
-        hdr.push($(th).text().trim().toLowerCase())
-      );
-      if (hdr.length >= 2) {
-        const rows = [];
-        $t.find('tbody tr').each((__, tr) => {
-          const tds = $(tr).find('td');
-          if (!tds.length) return;
-          rows.push(
-            tds
-              .map((__, td) => $(td).text().trim())
-              .get()
-          );
-        });
-        if (rows.length) {
-          tbl = { header: hdr, rows };
-        }
-      }
-    });
-  }
-
-  // 3) Si no hay tabla, intentar filas "tipo card"
-  if (!tbl) {
-    const altRows = [];
-
-    $('div[role="row"], .ant-table-row').each((_, el) => {
-      const cells = $(el)
-        .find('div[role="cell"], span, td')
-        .map((__, c) => $(c).text().trim())
-        .get()
-        .filter(Boolean);
-
-      if (cells.length >= 1) {
-        altRows.push(cells);
-      }
-    });
-
-    console.log('[trend-buzz][HTML] altRows (no table):', altRows.length);
-
-    if (altRows.length) {
-      const header = ['term', 'searchTrend'];
-      const rows = altRows;
-      tbl = { header, rows };
-    }
-  }
-
-  if (!tbl) {
-    console.log('[trend-buzz][HTML] ninguna tabla ni filas válidas encontradas');
-    return { count: 0, results: [], header: [], htmlLength: (html?.length || 0) };
+    console.log('[trend-buzz][HTML] NO table detected');
+    return { count: 0, results: [] };
   }
 
   const h = tbl.header;
-  console.log('[trend-buzz][HTML] header detectado:', h);
+  console.log('[trend-buzz][HTML] FINAL header used:', h);
 
-  let iTerm = 0;
-  let iTrend = h.length > 1 ? 1 : 0;
+  // columnas reales
+  let iTerm   = h.findIndex(x => /(keyword|keywords|term)/i.test(x));
+  let iTrend  = h.findIndex(x => /(search\s*trend|trend)/i.test(x));
+  let iChange = h.findIndex(x => /(change)/i.test(x));
 
-  const idxTerm = h.findIndex(x =>
-    /(keyword|color|product|recipient|style|material|term)/i.test(x)
-  );
-  if (idxTerm >= 0) iTerm = idxTerm;
+  // fallback basado en tu cabecera real: [ '#', 'keywords', 'search trend', 'change' ]
+  if (iTerm < 0)  iTerm  = 1; // "keywords"
+  if (iTrend < 0) iTrend = 2; // "search trend"
 
-  const idxTrend = h.findIndex(x =>
-    /search\s*trend|trend|volume|search|score/i.test(x)
-  );
-  if (idxTrend >= 0) iTrend = idxTrend;
+  console.log('[trend-buzz][HTML] column indexes:', { iTerm, iTrend, iChange });
 
   const results = tbl.rows
-    .map(row => {
-      const term = (row[iTerm] || '').trim();
-      const trend = (row[iTrend] || '').trim();
+    .map(r => {
+      const term   = (r[iTerm]  || '').trim();
+      const trend  = (r[iTrend] || '').trim();
+      const change = iChange >= 0 ? (r[iChange] || '').trim() : '';
+
       if (!term) return null;
-      return { term, searchTrend: trend || '' };
+      return { term, searchTrend: trend, change };
     })
     .filter(Boolean);
 
-  console.log('[trend-buzz][HTML] rows parsed:', results.length);
+  console.log('[trend-buzz][HTML] parsed rows:', results.length);
 
-  return { count: results.length, results, header: h };
+  return { count: results.length, results };
 }
 
 /* ===== Trend Buzz JSON parser (via XHR /api/trend-buzz) ===== */
@@ -536,16 +480,18 @@ function parseTrendingReportJSON(json) {
   return { count: results.length, results };
 }
 
-/* ===== Monthly trending-report HTML parser (más permisivo + logs) ===== */
+/* ===== Monthly trending-report HTML parser (agresivo + logs) ===== */
 function parseTrendingReportHTML(html) {
   const $ = cheerio.load(html);
+
+  const tableCount = $('table').length;
+  console.log('[monthly-trends][HTML] tables on page:', tableCount);
 
   let tbl = tableByHeaders($, [
     /(keyword|search\s*term|term|product|recipient|style|material)/i,
     /(searches|volume|this\s*month|last\s*month|month)/i
   ]);
 
-  // Fallback: primera tabla con >=2 th
   if (!tbl) {
     $('table').each((_, t) => {
       if (tbl) return;
@@ -573,7 +519,31 @@ function parseTrendingReportHTML(html) {
   }
 
   if (!tbl) {
-    console.log('[monthly-trends][HTML] ninguna tabla encontrada compatible');
+    const altRows = [];
+
+    $('div[role="row"], .ant-table-row').each((_, el) => {
+      const cells = $(el)
+        .find('div[role="cell"], span, td')
+        .map((__, c) => $(c).text().trim())
+        .get()
+        .filter(Boolean);
+
+      if (cells.length >= 1) {
+        altRows.push(cells);
+      }
+    });
+
+    console.log('[monthly-trends][HTML] altRows (no table):', altRows.length);
+
+    if (altRows.length) {
+      const header = ['term', 'thisMonth', 'lastMonth', 'change', 'searches'];
+      const rows = altRows;
+      tbl = { header, rows };
+    }
+  }
+
+  if (!tbl) {
+    console.log('[monthly-trends][HTML] ninguna tabla NI filas válidas encontradas');
     return { count: 0, results: [], header: [], htmlLength: (html?.length || 0) };
   }
 
@@ -1175,7 +1145,7 @@ app.get('/erank/trend-buzz', async (req, res) => {
 
     await openAndWait(page, `${BASE}/trend-buzz`, `${BASE}/dashboard`);
 
-    // Period selector (por si afecta a datos)
+    // selector de periodo (por si cambia los datos)
     try {
       const periodMap = {
         thirty: /past\s*30\s*days/i,
@@ -1194,7 +1164,6 @@ app.get('/erank/trend-buzz', async (req, res) => {
       console.warn('trend-buzz period switch failed:', e.message || e);
     }
 
-    // 1) Intento de click en el TAB correcto
     let clicked = false;
     try {
       const tab = page.getByRole('tab', { name: new RegExp(`^${tabName}$`, 'i') });
@@ -1225,7 +1194,6 @@ app.get('/erank/trend-buzz', async (req, res) => {
     await page.waitForSelector('table tbody tr td', { timeout: 15000 }).catch(() => {});
     await autoScroll(page, 4);
 
-    // 2) Captura XHR
     const cap = await captureJson(
       page,
       x =>
@@ -1296,8 +1264,6 @@ app.get('/erank/trend-buzz', async (req, res) => {
 
 /* ===========================
    MONTHLY TRENDS
-   (captura XHR /api/trending-report desde la UI + fallback HTML)
-   + DEBUG LOGS
 =========================== */
 app.get('/erank/monthly-trends', async (req, res) => {
   const marketplace = (req.query.marketplace || DEFAULT_MARKET).toLowerCase();
